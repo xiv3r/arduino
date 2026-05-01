@@ -1,30 +1,13 @@
-name: Build
+name: Build ESP32-S3
 
 on:
   workflow_dispatch:
-    inputs:
-      board:
-        description: 'Select target board'
-        required: true
-        type: choice
-        options:
-          - esp32:esp32:esp32
-          - esp32:esp32:esp32s3
-          - esp32:esp32:esp32c3
-          - esp32:esp32:esp32s2
-          - esp8266:esp8266:nodemcuv2
-          - esp8266:esp8266:generic
-          - esp8266:esp8266:d1_mini
   release:
     types: [published]
-
+    
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-    
-    strategy:
-      matrix:
-        board: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('[{{"fqbn":"{0}","name":"{0}"}}]', github.event.inputs.board) || '[{"fqbn":"esp32:esp32:esp32","name":"esp32"},{"fqbn":"esp32:esp32:esp32s3","name":"esp32-s3"},{"fqbn":"esp32:esp32:esp32c3","name":"esp32-c3"},{"fqbn":"esp32:esp32:esp32s2","name":"esp32-s2"},{"fqbn":"esp8266:esp8266:nodemcuv2","name":"esp8266-nodemcuv2"},{"fqbn":"esp8266:esp8266:generic","name":"esp8266-generic"},{"fqbn":"esp8266:esp8266:d1_mini","name":"esp8266-d1-mini"}]') }}
     
     steps:
     - name: Checkout repository
@@ -34,46 +17,30 @@ jobs:
       run: |
         curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
         arduino-cli config init
-        
-        # Add ESP32 board URL
         arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-        
-        # Add ESP8266 board URL
-        arduino-cli config add board_manager.additional_urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
-        
         arduino-cli core update-index
-        
-        # Install ESP32 core
         arduino-cli core install esp32:esp32
-        
-        # Install ESP8266 core
-        arduino-cli core install esp8266:esp8266
         
         # Install libraries
         arduino-cli lib install "Preferences"
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "NTPClient"
-        
-        # Install RTClib with specific version 
         git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
-
-    - name: Compile for ${{ matrix.board.name }}
-      run: |
-        echo "Compiling for ${{ matrix.board.name }} (${{ matrix.board.fqbn }})..."
-        arduino-cli compile --fqbn ${{ matrix.board.fqbn }} --output-dir firmware .
         
+        cd ESP32-S3
+        arduino-cli compile --fqbn esp32:esp32:esp32s3 --output-dir firmware .
+         
     - name: Determine release tag
       id: get_tag
       run: |
         if [ "${{ github.event_name }}" == "release" ]; then
           TAG_NAME="${{ github.event.release.tag_name }}"
         else
-          TAG_NAME="firmware"
+          TAG_NAME="esp32-s3"
         fi
         echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
     - name: Delete existing release assets
-      if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
       uses: actions/github-script@v7
       with:
         script: |
