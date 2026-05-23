@@ -1,4 +1,4 @@
-name: Build ESP32-S3
+name: Build ESP32-S3 Firmware
 
 on:
   workflow_dispatch:
@@ -26,8 +26,6 @@ jobs:
         arduino-cli lib install "Preferences"
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "NTPClient"
-
-        # Compile
         git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
         
         arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi --output-dir firmware .
