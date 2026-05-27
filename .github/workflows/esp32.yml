@@ -18,26 +18,23 @@ jobs:
         sudo apt update
         sudo apt install wget -y
 
-        ## DEB
+        # Arduino-Cli Debian package
         wget -O arduino-cli.deb https://github.com/arduino/arduino-cli/releases/download/v1.5.0/arduino-cli_1.5.0-1_amd64.deb
         sudo dpkg -i arduino-cli.deb
         sudo apt --fix-broken install -y
         sudo dpkg --configure -a
         
-        ## MAIN 
-        ## curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
         arduino-cli config init
         arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-        ## arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
         arduino-cli core update-index
         arduino-cli core install esp32:esp32
         
         # Install libraries
-        # arduino-cli lib install "Preferences"
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "NTPClient"
         git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
-        
+
+        # Compile firmware
         arduino-cli compile --fqbn esp32:esp32:esp32 --clean --output-dir firmware .
          
     - name: Determine release tag
@@ -46,7 +43,7 @@ jobs:
         if [ "${{ github.event_name }}" == "release" ]; then
           TAG_NAME="${{ github.event.release.tag_name }}"
         else
-          TAG_NAME="esp32-gen"
+          TAG_NAME="esp32"
         fi
         echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
