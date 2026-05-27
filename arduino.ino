@@ -312,6 +312,42 @@ void performMemoryCleanup();
 void cleanupStaleResources();
 void checkWebServerHealth();
 void immediateDS3231Sync();
+void saveConfiguration();
+void syncInternalRTC(time_t rawUtcEpoch);
+void initDefaults();
+void loadGPIOConfig();
+void loadConfiguration();
+void loadExtConfig();
+void saveGPIOConfig();
+void saveExtConfig();
+void updateScheduleCache();
+void setupWebServer();
+
+// Web Server Handlers
+void handleGetRelays();
+void handleManualControl();
+void handleResetManual();
+void handleSaveRelay();
+void handleRelayName();
+void handleGetTime();
+void handleGetWiFi();
+void handleSaveWiFi();
+void handleWiFiScanStart();
+void handleWiFiScanResults();
+void handleGetNTP();
+void handleSaveNTP();
+void handleSyncNTP();
+void handleGetAP();
+void handleSaveAP();
+void handleGetGPIOConfig();
+void handleSaveGPIOConfig();
+void handleAddGPIO();
+void handleDeleteGPIO();
+void handleToggleActiveLow();
+void handleGlobalActiveMode();
+void handleGetSystem();
+void handleReset();
+void handleFactoryReset();
 
 // ─── Get local epoch (UTC + GMT offset + DST) ──────────────────────────────
 inline time_t getLocalEpoch(time_t utcEpoch) {
