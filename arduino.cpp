@@ -17,6 +17,7 @@
 #include <ESPmDNS.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <Arduino.h>
 
 // ─── Preferences (NVS) ───────────────────────────────────────────────────────
 Preferences preferences;
