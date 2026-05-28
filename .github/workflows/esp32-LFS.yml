@@ -21,12 +21,18 @@ jobs:
       run: |
         sudo apt-get install -y git-lfs
         git lfs install
-        git lfs track "firmware/*.bin"
+        git lfs track "firmware/**/*.bin"
         git add .gitattributes
 
-    - name: Clean old firmware
+    - name: Clean old firmware (keep merged.bin)
       run: |
-        rm -rf firmware/*
+        # Remove all files except *.merged.bin
+        find firmware/ -type f ! -name "*.merged.bin" -delete 2>/dev/null || true
+        
+        # Remove empty directories
+        find firmware/ -type d -empty -delete 2>/dev/null || true
+        
+        # Ensure firmware directory exists
         mkdir -p firmware
 
     - name: Install Arduino-cli
@@ -58,18 +64,8 @@ jobs:
         git config user.name "GitHub Actions"
         git config user.email "actions@github.com"
         
-        # Remove old files from git tracking
-        git rm -r --cached firmware/ 2>/dev/null || true
-        
-        # Remove all files except *.merge.bin
-        find firmware/ -type f ! -name "*.merged.bin" -delete
-        
-        # Remove empty directories
-        find firmware/ -type d -empty -delete
-        
-        # Add all new .bin files
-        find firmware/ -name "*.bin" -type f -exec git add {} \;
-        git add .gitattributes
+        # Stage all changes (additions, modifications, deletions)
+        git add firmware/ .gitattributes
         
         # Show what will be committed
         echo "Changes to be committed:"
