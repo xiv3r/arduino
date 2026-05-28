@@ -62,7 +62,7 @@ jobs:
         git rm -r --cached firmware/ 2>/dev/null || true
         
         # Remove all files except *.merge.bin
-        find firmware/ -type f ! -name "*.merge.bin" -delete
+        find firmware/ -type f ! -name "*.merged.bin" -delete
         
         # Remove empty directories
         find firmware/ -type d -empty -delete
