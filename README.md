@@ -10,4 +10,8 @@
 ```
 arduino-cli lib install "ArduinoJson"
 arduino-cli lib install "NTPClient"
+
+# Install RTClib (external)
+git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
+
 ```
