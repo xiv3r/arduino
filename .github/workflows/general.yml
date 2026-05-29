@@ -33,14 +33,16 @@ jobs:
     - name: Install Arduino-cli
       run: |
         curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
+        
         arduino-cli config init
         
-        # Add ESP32 board URL
+        # ESP32 board URL
         arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
         
-        # Add ESP8266 board URL
+        # ESP8266 board URL
         arduino-cli config add board_manager.additional_urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
-        
+
+        # Update core index
         arduino-cli core update-index
         
         # Install ESP32 core
@@ -53,7 +55,7 @@ jobs:
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "NTPClient"
         
-        # Install RTClib
+        # Install RTClib (external)
         git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
 
     - name: Compile for ${{ matrix.board.name }}
