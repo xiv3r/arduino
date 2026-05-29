@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       board:
-        description: 'Select target board'
+        description: 'Select Board'
         required: true
         type: choice
         options:
           - esp32:esp32:esp32
-          - esp32:esp32:esp32s3
+          - esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi
           - esp32:esp32:esp32c3
           - esp32:esp32:esp32s2
           - esp8266:esp8266:nodemcuv2
@@ -50,17 +50,16 @@ jobs:
         arduino-cli core install esp8266:esp8266
         
         # Install libraries
-        arduino-cli lib install "Preferences"
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "NTPClient"
         
-        # Install RTClib with specific version 
+        # Install RTClib
         git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
 
     - name: Compile for ${{ matrix.board.name }}
       run: |
         echo "Compiling for ${{ matrix.board.name }} (${{ matrix.board.fqbn }})..."
-        arduino-cli compile --fqbn ${{ matrix.board.fqbn }} --output-dir firmware .
+        arduino-cli compile --fqbn ${{ matrix.board.fqbn }} --clean --output-dir firmware .
         
     - name: Determine release tag
       id: get_tag
