@@ -6,7 +6,7 @@
 4. The compiled firmware is located in the release section
 
 # Custom libraries
-> Find inside `.github/workflows/general.yml`
+> Find inside `.github/workflows/general.yml` and add another libraries.
 ```
 arduino-cli lib install "ArduinoJson"
 arduino-cli lib install "NTPClient"
