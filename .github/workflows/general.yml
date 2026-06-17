@@ -61,8 +61,7 @@ jobs:
         # Install libraries
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "NTPClient"
-        arduino-cli lib install "AsyncTCP"
-        arduino-cli lib install "AsyncMqttClient"
+        arduino-cli lib install "PubSubClient"
         
         # Install RTClib (external)
         git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
