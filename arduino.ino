@@ -18,6 +18,7 @@
 #include <ESPmDNS.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <AsyncTCP.h>
 #include <AsyncMqttClient.h>
 
 // =============================================================================
