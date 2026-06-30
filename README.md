@@ -1,7 +1,7 @@
 # Build the Firmware Binaries Automatically
 > ⚠️ Only the unified .ino file is supported
 1. Fork the repository
-2. Edit and paste your code inside `arduino.ino`
+2. Edit and paste your code inside `sketch.ino` or make any filename.ino 
 3. Go to actions > general build > run workflows > select board > run
 4. The compiled firmware is located in the release section
 
