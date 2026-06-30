@@ -69,6 +69,7 @@ jobs:
     - name: Compile for ${{ matrix.board.name }}
       run: |
         echo "Compiling for ${{ matrix.board.name }} (${{ matrix.board.fqbn }})..."
+        mv *.ino arduino.ino
         arduino-cli compile --fqbn ${{ matrix.board.fqbn }} --clean --output-dir firmware .
         
     - name: Determine release tag
