@@ -1,9 +1,11 @@
 name: Build ESP32-S3 Firmware
 
 on:
-  workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    branches:
+      - main
+    paths:
+      - 'ESP32-S3/*.ino'
     
 jobs:
   build-and-release:
@@ -30,10 +32,11 @@ jobs:
         # Install libraries
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "PubSubClient"
-        git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
+        ## git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
 
         # Compile Firmware
-        mv *.ino arduino.ino
+        cd ESP32-S3
+        mv *.ino ESP32-S3.ino
         arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi --clean --output-dir firmware .
 
         # Rename     
@@ -97,6 +100,6 @@ jobs:
       with:
         tag_name: ${{ steps.get_tag.outputs.tag_name }}
         files: |
-          firmware/*.bin
+          ESP32-S3/firmware/*.bin
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
