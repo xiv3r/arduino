@@ -7,7 +7,7 @@ on:
   
 jobs:
   build-and-release:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     
     steps:
     - name: Checkout repository
@@ -15,9 +15,6 @@ jobs:
 
     - name: Install Arduino-cli
       run: |
-        sudo apt update 
-        sudo apt install wget -y
-        
         # Arduino-Cli Debian package
         wget -O arduino-cli.deb https://github.com/arduino/arduino-cli/releases/download/v1.5.2-rc.1/arduino-cli_1.5.2-rc.1-1_arm64.deb
         sudo dpkg -i arduino-cli.deb
