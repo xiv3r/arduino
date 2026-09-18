@@ -44,8 +44,6 @@ jobs:
         rm firmware/*.ino.partitions.bin
         
         mv firmware/*.ino.merged.bin      firmware/esp32-dump-0x0.bin
-        ls -la
-        ls -lh
         
     - name: Determine release tag
       id: get_tag
