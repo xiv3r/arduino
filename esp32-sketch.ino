@@ -1071,7 +1071,7 @@ function dayMaskToStr(d){
 }
 
 function monthDayMaskToStr(md){
-  if(md===0) return 'None (fires every day!)';
+  if(md===0) return '';
   if(md===0xFFFFFFFF) return 'All month days';
   let s='';
   for(let i=0;i<31;i++) if(md&(1<<i)) s+=(i+1)+',';
@@ -1094,9 +1094,7 @@ function nightBadge(sc){
   const mm=monthMaskToStr(sc.monthMask||0x0FFF);  
   let info=ds;
   if(ms) info+=' | Days:'+ms;
-  if(mm!=='All months') info+=' | Months:'+mm;
-  if((sc.days & 0x7F) === 0)
-    return'<span class="night" style="background:#FFEBEE;color:#C62828">&#x26A0; No days selected &mdash; will not run</span>';
+  if(mm!=='All months') info+=' | Months:'+mm;  
   if(a===b)return'<span class="night always">&#x25CF; Always ON ('+info+')</span>';
   if(a>b) return'<span class="night">&#x1F319; Overnight ('+info+')</span>';
   return'<span class="night">&#x1F319; '+info+'</span>';
@@ -1258,33 +1256,18 @@ function toggleDay(ri,si,dayIdx){
 
 function toggleMonthDay(ri,si,dayIdx){
   const mask = 1<<dayIdx;
-  let md = relays[ri].schedules[si].monthDays || 0;
-  if(md === 0){
-    md = mask;
-  } else if(md === mask){
-    toast('At least one month day must remain selected', false);
-    return;
-  } else {
-    md ^= mask;
-  }
-  relays[ri].schedules[si].monthDays = md;
+  if(!relays[ri].schedules[si].monthDays) relays[ri].schedules[si].monthDays = 0;
+  relays[ri].schedules[si].monthDays ^= mask;
   const mdayEl = document.getElementById('mday_'+ri+'_'+si).children[dayIdx];
-  if(mdayEl) mdayEl.className = 'mday' + ((md & mask)?' on':'');
+  if(mdayEl) mdayEl.className = 'mday' + ((relays[ri].schedules[si].monthDays & mask)?' on':'');
   const nb=document.getElementById('nb_'+ri+'_'+si);
   if(nb)nb.innerHTML=nightBadge(relays[ri].schedules[si]);
 }
 
 function toggleMonth(ri,si,mIdx){  
   const mask = 1<<mIdx;
-  let mm = relays[ri].schedules[si].monthMask;
-  if(mm === undefined) mm = 0x0FFF;
-  if(mm === 0x0FFF) mm = 0; 
-  if(mm === mask) { 
-    toast('At least one month must remain selected', false);
-    return;
-  }
-  mm ^= mask;
-  relays[ri].schedules[si].monthMask = mm || 0x0FFF;
+  if(!relays[ri].schedules[si].monthMask) relays[ri].schedules[si].monthMask = 0x0FFF;
+  relays[ri].schedules[si].monthMask ^= mask;
   const monEl = document.getElementById('mon_'+ri+'_'+si).children[mIdx];
   if(monEl) monEl.className = 'month' + ((relays[ri].schedules[si].monthMask & mask)?' on':'');
   const nb=document.getElementById('nb_'+ri+'_'+si);
