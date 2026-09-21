@@ -146,7 +146,7 @@ const byte       DNS_PORT = 53;
 // =============================================================================
 #define MAX_RELAYS 16
 // change gpio
-const uint8_t DEFAULT_RELAY_PINS[] = {32, 33, 25, 26, 27, 14, 13, 23, 1, 3, 19, 18, 5, 4, 2, 15};
+const uint8_t DEFAULT_RELAY_PINS[] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
 
 // =============================================================================
 //  Dynamic GPIO Config
@@ -1794,7 +1794,7 @@ function toast(m,ok=true){const t=document.getElementById('toast');t.textContent
 function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
 // change gpio pins
-const DEFAULT_PINS = [32,33,25,26,27,14,13,23,1,3,19,18,5,4,2,15];
+const DEFAULT_PINS = [23,32,33,25,26,27,14,13,1,3,19,18,5,4,2,15];
 let gpioData = null;
 function saveGlobalMode() {
     const mode = parseInt(document.getElementById('globalMode').value);
@@ -3523,7 +3523,7 @@ void handleGetGPIOConfig() {
     }
     JsonArray available = doc.createNestedArray("availablePins");
     // change gpio pins
-    int validPins[] = {32, 33, 25, 26, 27, 14, 13, 23, 1, 3, 19, 18, 5, 4, 2, 15};
+    int validPins[] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
     for (int p : validPins) {
         available.add(p);
     }
