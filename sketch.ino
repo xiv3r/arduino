@@ -31,7 +31,7 @@ Preferences preferences;
 //  Year 2106+ Support
 // =============================================================================
 #define MIN_UNIX_TIME_64 1577836800ULL
-#define MAX_UNIX_TIME_64 4102444800ULL
+#define MAX_UNIX_TIME_64 4294967295ULL 
 #define VALID_UNIX_TIME_64(epoch) ((epoch) >= MIN_UNIX_TIME_64 && (epoch) <= MAX_UNIX_TIME_64)
 
 // =============================================================================
@@ -410,7 +410,11 @@ struct tm* gmtime64(uint64_t* timep) {
     tm.tm_mon = (int)(m - 1);
     tm.tm_year = (int)(y - 1900ULL);
     tm.tm_wday = (int)((days + 4ULL) % 7ULL);
-    tm.tm_yday = (int)doy;
+    {
+        uint64_t isLeap = ((y % 4ULL == 0) && (y % 100ULL != 0)) || (y % 400ULL == 0);
+        tm.tm_yday = (m <= 2ULL) ? (int)(doy - 306ULL)
+                                 : (int)(doy + (isLeap ? 60ULL : 59ULL));
+    }
     tm.tm_isdst = 0;
     return &tm;
 }
@@ -469,7 +473,7 @@ void initScheduleDefaults(int relayIndex) {
     memset(&relayConfigs[relayIndex], 0, sizeof(RelayConfig));
     for (int s = 0; s < 8; s++) {
         relayConfigs[relayIndex].schedule.days[s] = DAY_ALL;
-        relayConfigs[relayIndex].schedule.monthDays[s] = 0;
+        relayConfigs[relayIndex].schedule.monthDays[s] = 0x7FFFFFFFUL;
         relayConfigs[relayIndex].schedule.monthMask[s] = MONTH_ALL;
     }
     snprintf(relayConfigs[relayIndex].name, 16, "Relay %d", relayIndex + 1);
@@ -587,14 +591,14 @@ void performRTCReabase() {
         } else {
             elapsedMicros = (0xFFFFFFFF - rtcMicrosAtLastSync) + currentMicros + 1;
         }
-        float elapsedSeconds = (float)elapsedMicros / 1000000.0f;
-        float adjustedSeconds = elapsedSeconds * driftCompensation;
+        double elapsedSeconds = (double)elapsedMicros / 1000000.0;
+        double adjustedSeconds = elapsedSeconds * (double)driftCompensation;
         uint64_t secondsToAdd = (uint64_t)adjustedSeconds;
         internalEpoch += secondsToAdd;
-        float fractionalSeconds = adjustedSeconds - (float)secondsToAdd;
-        if (fractionalSeconds >= 0.5f) {
-            internalEpoch++;
-        }
+        unsigned long committedMicros = (unsigned long)(((uint64_t)((double)secondsToAdd * 1000000.0 / (double)driftCompensation)) & 0xFFFFFFFFULL);
+        rtcMicrosAtLastSync = (rtcMicrosAtLastSync + committedMicros) & 0xFFFFFFFFUL;
+        lastRTCRebase = currentMillis;
+        return;
     }
     rtcMicrosAtLastSync = currentMicros;
     lastRTCRebase = currentMillis;
@@ -615,14 +619,10 @@ uint64_t getCurrentEpoch() {
             performRTCReabase();
             return internalEpoch;
         }
-        float elapsedSeconds = (float)elapsedMicros / 1000000.0f;
-        float adjustedSeconds = elapsedSeconds * driftCompensation;
-        uint64_t secondsToAdd = (uint64_t)adjustedSeconds;
+        double elapsedSeconds = (double)elapsedMicros / 1000000.0;
+        double adjustedSeconds = elapsedSeconds * (double)driftCompensation;
+        uint64_t secondsToAdd = (uint64_t)adjustedSeconds; 
         uint64_t result = internalEpoch + secondsToAdd;
-        float fractional = adjustedSeconds - (float)secondsToAdd;
-        if (fractional >= 0.5f) {
-            result++;
-        }
         return result;
     }
     if (rtcPresent && rtcTimeValid) {
@@ -1058,15 +1058,16 @@ function escapeHtml(text) {
 function load(){
   if(busy)return;
   fetch('/api/relays').then(r=>r.json()).then(d=>{
-    if(Array.isArray(d)){
-      d.forEach(r=>{
-        if(r && Array.isArray(r.schedules)){
-          r.schedules.forEach(s=>{
-            if(s.monthDays === 0x7FFFFFFF || s.monthDays === 0xFFFFFFFF) s.monthDays = 0;
-          });
-        }
+    if(!Array.isArray(d)){toast('Load error',false);return;}
+    d=d.filter(r=>r&&typeof r==='object');
+    d.forEach(r=>{
+      if(!Array.isArray(r.schedules))r.schedules=[];
+      r.schedules=r.schedules.filter(s=>s&&typeof s==='object');
+      r.schedules.forEach(s=>{
+        if(s.monthDays === 0x7FFFFFFF || s.monthDays === 0xFFFFFFFF) s.monthDays = 0;
       });
-    }
+      while(r.schedules.length<NS)r.schedules.push({startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0,monthMask:0x0FFF});
+    });
     relays=d;render();
   }).catch(()=>toast('Load error',false));
 }
@@ -1213,7 +1214,7 @@ function render(){
 </div>
 <div class="slist">`;
     for(let s=0;s<NS;s++){
-      const sc2=r.schedules[s];
+      const sc2=r.schedules[s]||{startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0,monthMask:0x0FFF};
       const dayBits = (sc2.days === undefined || sc2.days === null) ? 0x7F : sc2.days;
       const rawMonthDayBits = (sc2.monthDays === undefined || sc2.monthDays === null) ? 0 : sc2.monthDays;
       const monthDayBits = (rawMonthDayBits === 0x7FFFFFFF || rawMonthDayBits === 0xFFFFFFFF) ? 0 : rawMonthDayBits;
@@ -1236,14 +1237,14 @@ function render(){
         html+=`<div class="day${(dayBits&mask)?' on':''}" onclick="toggleDay(${i},${s},${d})">${D[d]}</div>`;
       }
       html+=`</div>
-<div class="sched-section">Days of Month</div>
+<div class="sched-section">Days of Month <small style="text-transform:none;color:#90A4AE;font-weight:400">(Empty = All days)</small></div>
 <div class="mdays" id="mday_${i}_${s}">`;
       for(let d=0;d<31;d++){
         const mask = 1<<d;
         html+=`<div class="mday${(monthDayBits&mask)?' on':''}" onclick="toggleMonthDay(${i},${s},${d})" title="Day ${d+1}">${d+1}</div>`;
       }
       html+=`</div>
-<div class="sched-section">Months of Year</div>
+<div class="sched-section">Months of Year <small style="text-transform:none;color:#90A4AE;font-weight:400">(All selected = All months)</small></div>
 <div class="months" id="mon_${i}_${s}">`;
       for(let m=0;m<12;m++){
         const mask = 1<<m;
@@ -1542,7 +1543,10 @@ function saveWiFi(){
     const btn = document.querySelector('.bsave');
     btn.disabled = true;
     btn.textContent = 'Saving...';
-    fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password:document.getElementById('pw').value})})
+    const body = {ssid: ssid};
+    const pwVal = document.getElementById('pw').value;
+    if (pwVal.length > 0) body.password = pwVal;
+    fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
         btn.disabled = false;
         btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
@@ -1804,8 +1808,8 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="pins"></div>
 </div>
 
-<div style="margin-top:16px;display:flex;gap:8px">
-<button class="btn bwarn" onclick="resetDefaults()" style="padding:9px 18px">&#x1F504; Reset to Default</button>
+<div style="margin-top:16px">
+<button class="btn bsave" onclick="resetDefaults()" style="margin-top:0;width:100%;padding:9px 20px;background:#1565C0;color:#fff;font-size:13px;font-weight:600;border-radius:6px">&#x1F504; Reset to Default</button>
 </div>
 </div>
 </main>
@@ -2003,7 +2007,7 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 
 <div class="card fcrd">
 <p style="font-weight:700;margin-bottom:12px">Device Control</p>
-<div style="display:flex;gap:8px;flex-wrap:wrap">
+<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center">
 <button class="btn bwarn" onclick="rst()" style="padding:9px 18px;border-radius:6px;font-size:13px;font-weight:600">&#x1F504; Verify Services</button>
 <button class="btn bdanger" onclick="fct()" style="padding:9px 18px;border-radius:6px;font-size:13px;font-weight:600">&#x26A0; Factory Reset</button>
 </div>
@@ -2167,8 +2171,9 @@ void syncInternalRTC(uint64_t rawUtcEpoch, uint8_t source) {
     ntpFailCount = 0;
     if (rtcPresent) {
         immediateDS3231Sync();
+    } else {
+        saveRTCState();
     }
-    saveRTCState();
     updateScheduleCache();
 }
 
@@ -2231,8 +2236,13 @@ void processNTPResponse() {
                 ntpSecs64 = candidate;
                 if (diffNext < diffCur && diffNext < diffPrev) ntpSecs64 = candidateNext;
                 else if (diffPrev < diffCur && diffPrev < diffNext) ntpSecs64 = candidatePrev;
-            } else if (secs < 0x70000000UL) {
-                ntpSecs64 += 0x100000000ULL;
+            } else {
+                uint64_t unixEra0 = ntpSecs64 - NTP_EPOCH_OFFSET;
+                uint64_t unixEra1 = unixEra0 + 0x100000000ULL;
+                if (!VALID_UNIX_TIME_64(unixEra0) &&
+                    (VALID_UNIX_TIME_64(unixEra1) || secs < 0x70000000UL)) {
+                    ntpSecs64 += 0x100000000ULL;
+                }
             }
             uint64_t unixEpoch = ntpSecs64 - NTP_EPOCH_OFFSET;
             if (VALID_UNIX_TIME_64(unixEpoch)) {
@@ -2336,8 +2346,9 @@ void handleBrowserTimeSync() {
             rtcTimeValid = true;
             lastRTCDSync = millis();
         }
+    } else {
+        saveRTCState();
     }
-    saveRTCState();
     updateScheduleCache();
     uint64_t localEpoch = getLocalEpoch(browserUtcEpoch);
     struct tm* ti = gmtime64(&localEpoch);
@@ -2384,6 +2395,49 @@ void beginWiFiConnect() {
 }
 
 // =============================================================================
+//  SINGLE SCHEDULE ACTIVE CHECK
+// =============================================================================
+inline bool isSingleScheduleSlotActive(uint64_t epoch, uint64_t localEpoch, struct tm* ti,
+                                       int currentWeekday, int currentMonthDay, int currentMonth, int currentSeconds,
+                                       const TimerSchedule& sched, int slot) {
+    if (!sched.enabled[slot]) return false;
+    uint16_t monthMask = sched.monthMask[slot];
+    uint32_t monthDayMask = sched.monthDays[slot];
+    int start = sched.startHour[slot] * 3600 + sched.startMinute[slot] * 60 + sched.startSecond[slot];
+    int stop  = sched.stopHour[slot]  * 3600 + sched.stopMinute[slot]  * 60 + sched.stopSecond[slot];
+    int cur = currentSeconds;
+    if (start == stop) {
+        if (!(monthMask & (1 << currentMonth))) return false;
+        if (!(monthDayMask & (1 << (currentMonthDay - 1)))) return false;
+        if (sched.days[slot] & (1 << currentWeekday)) return true;
+        return false;
+    } else if (start < stop) {
+        if (!(monthMask & (1 << currentMonth))) return false;
+        if (!(monthDayMask & (1 << (currentMonthDay - 1)))) return false;
+        if ((sched.days[slot] & (1 << currentWeekday)) && cur >= start && cur < stop) return true;
+        return false;
+    } else {
+        if (cur >= start) {
+            if (!(monthMask & (1 << currentMonth))) return false;
+            if (!(monthDayMask & (1 << (currentMonthDay - 1)))) return false;
+            if (sched.days[slot] & (1 << currentWeekday)) return true;
+            return false;
+        } else if (cur < stop) {
+            uint64_t checkEpoch = epoch - 86400ULL;
+            uint64_t checkLocalEpoch = getLocalEpoch(checkEpoch);
+            struct tm* checkDate = gmtime64(&checkLocalEpoch);
+            if (!checkDate) return false;
+            if (!(monthMask & (1 << checkDate->tm_mon))) return false;
+            if (!(monthDayMask & (1 << (checkDate->tm_mday - 1)))) return false;
+            if (sched.days[slot] & (1 << checkDate->tm_wday)) return true;
+            return false;
+        } else {
+            return false;
+        }
+    }
+}
+
+// =============================================================================
 //  SCHEDULE CACHE
 // =============================================================================
 void updateScheduleCache() {
@@ -2405,51 +2459,11 @@ void updateScheduleCache() {
         }
         bool hasActive = false;
         for (int s = 0; s < 8; s++) {
-            if (!relayConfigs[i].schedule.enabled[s]) continue;
-            uint16_t monthMask = relayConfigs[i].schedule.monthMask[s];
-            uint32_t monthDayMask = relayConfigs[i].schedule.monthDays[s];
-            int start = relayConfigs[i].schedule.startHour[s] * 3600
-                      + relayConfigs[i].schedule.startMinute[s] * 60
-                      + relayConfigs[i].schedule.startSecond[s];
-            int stop = relayConfigs[i].schedule.stopHour[s] * 3600
-                     + relayConfigs[i].schedule.stopMinute[s] * 60
-                     + relayConfigs[i].schedule.stopSecond[s];
-            if (start == stop) {
-                if (!(monthMask & (1 << currentMonth))) continue;
-                if (!(monthDayMask & (1 << (currentMonthDay - 1)))) continue;
-                if (relayConfigs[i].schedule.days[s] & cachedTodayBit) {
-                    hasActive = true;
-                    break;
-                }
-            } else if (start < stop) {
-                if (!(monthMask & (1 << currentMonth))) continue;
-                if (!(monthDayMask & (1 << (currentMonthDay - 1)))) continue;
-                if ((relayConfigs[i].schedule.days[s] & cachedTodayBit) &&
-                    cur >= start && cur < stop) {
-                    hasActive = true;
-                    break;
-                }
-            } else {
-                if (cur >= start) {
-                    if (!(monthMask & (1 << currentMonth))) continue;
-                    if (!(monthDayMask & (1 << (currentMonthDay - 1)))) continue;
-                    if (relayConfigs[i].schedule.days[s] & (1 << currentWeekday)) {
-                        hasActive = true;
-                        break;
-                    }
-                } else if (cur < stop) {
-                    uint64_t checkEpoch = epoch - 86400ULL;
-                    uint64_t checkLocalEpoch = getLocalEpoch(checkEpoch);
-                    struct tm* checkDate = gmtime64(&checkLocalEpoch);
-                    if (checkDate) {
-                        if (!(monthMask & (1 << checkDate->tm_mon))) continue;
-                        if (!(monthDayMask & (1 << (checkDate->tm_mday - 1)))) continue;
-                        if (relayConfigs[i].schedule.days[s] & (1 << checkDate->tm_wday)) {
-                            hasActive = true;
-                            break;
-                        }
-                    }
-                }
+            if (isSingleScheduleSlotActive(epoch, localEpoch, ti,
+                                           currentWeekday, currentMonthDay, currentMonth, cur,
+                                           relayConfigs[i].schedule, s)) {
+                hasActive = true;
+                break;
             }
         }
         scheduleActiveCache[i] = hasActive;
@@ -2486,57 +2500,17 @@ void processRelaySchedules() {
             if (lastRelayOutputs[i] != targetState) {
                 setRelayOutput(i, targetState);
                 lastRelayOutputs[i] = targetState;
-                lastDebouncedState[i] = targetState;
             }
+            lastDebouncedState[i] = targetState;
             continue;
         }
         bool shouldBeOn = false;
         for (int s = 0; s < 8; s++) {
-            if (!relayConfigs[i].schedule.enabled[s]) continue;
-            uint16_t monthMask = relayConfigs[i].schedule.monthMask[s];
-            uint32_t monthDayMask = relayConfigs[i].schedule.monthDays[s];
-            int start = relayConfigs[i].schedule.startHour[s] * 3600
-                      + relayConfigs[i].schedule.startMinute[s] * 60
-                      + relayConfigs[i].schedule.startSecond[s];
-            int stop = relayConfigs[i].schedule.stopHour[s] * 3600
-                     + relayConfigs[i].schedule.stopMinute[s] * 60
-                     + relayConfigs[i].schedule.stopSecond[s];
-            if (start == stop) {
-                if (!(monthMask & (1 << currentMonthVal))) continue;
-                if (!(monthDayMask & (1 << (monthDay - 1)))) continue;
-                if (relayConfigs[i].schedule.days[s] & todayBit) {
-                    shouldBeOn = true;
-                    break;
-                }
-            } else if (start < stop) {
-                if (!(monthMask & (1 << currentMonthVal))) continue;
-                if (!(monthDayMask & (1 << (monthDay - 1)))) continue;
-                if ((relayConfigs[i].schedule.days[s] & todayBit) &&
-                    cur >= start && cur < stop) {
-                    shouldBeOn = true;
-                    break;
-                }
-            } else {
-                if (cur >= start) {
-                    if (!(monthMask & (1 << currentMonthVal))) continue;
-                    if (!(monthDayMask & (1 << (monthDay - 1)))) continue;
-                    if (relayConfigs[i].schedule.days[s] & (1 << currentWeekday)) {
-                        shouldBeOn = true;
-                        break;
-                    }
-                } else if (cur < stop) {
-                    uint64_t checkEpoch = epoch - 86400ULL;
-                    uint64_t checkLocalEpoch = getLocalEpoch(checkEpoch);
-                    struct tm* checkDate = gmtime64(&checkLocalEpoch);
-                    if (checkDate) {
-                        if (!(monthMask & (1 << checkDate->tm_mon))) continue;
-                        if (!(monthDayMask & (1 << (checkDate->tm_mday - 1)))) continue;
-                        if (relayConfigs[i].schedule.days[s] & (1 << checkDate->tm_wday)) {
-                            shouldBeOn = true;
-                            break;
-                        }
-                    }
-                }
+            if (isSingleScheduleSlotActive(epoch, localEpoch, ti,
+                                           currentWeekday, currentMonthDay, currentMonth, cur,
+                                           relayConfigs[i].schedule, s)) {
+                shouldBeOn = true;
+                break;
             }
         }
         if (lastDebouncedState[i] != shouldBeOn) {
@@ -2546,6 +2520,10 @@ void processRelaySchedules() {
                 lastDebouncedState[i] = shouldBeOn;
                 lastStateChange[i] = now;
             }
+        } else if (lastRelayOutputs[i] != shouldBeOn) {
+            setRelayOutput(i, shouldBeOn);
+            lastRelayOutputs[i] = shouldBeOn;
+            lastStateChange[i] = now;
         }
     }
 }
@@ -2883,6 +2861,13 @@ void loadConfiguration() {
     }
     if (!valid) {
         initDefaults();
+    }
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        for (int s = 0; s < 8; s++) {
+            if (relayConfigs[i].schedule.monthDays[s] == 0) {
+                relayConfigs[i].schedule.monthDays[s] = 0x7FFFFFFFUL;
+            }
+        }
     }
     strcpy(ap_ssid,     sysConfig.ap_ssid);
     strcpy(ap_password, sysConfig.ap_password);
@@ -3234,11 +3219,12 @@ void handleGetTime() {
 void handleGetWiFi() {
     lastConnectionActivity = millis();
     char buffer[384];
+    String localIPStr = WiFi.localIP().toString(); 
     snprintf(buffer, sizeof(buffer),
         "{\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d,\"sta_enabled\":%s}",
         sysConfig.sta_ssid,
         wifiConnected ? "true" : "false",
-        WiFi.localIP().toString().c_str(),
+        localIPStr.c_str(),
         wifiConnected ? (int)WiFi.RSSI() : 0,
         extConfig.sta_enabled ? "true" : "false"
     );
@@ -3264,17 +3250,22 @@ void handleSaveWiFi() {
         return;
     }
     const char* ssid = doc["ssid"];
-    const char* pw   = doc["password"];
     if (ssid && strlen(ssid) > 0 && strlen(ssid) < 32) {
         bool ssidChanged = (strcmp(sysConfig.sta_ssid, ssid) != 0);
         bool passChanged = false;
         strncpy(sysConfig.sta_ssid, ssid, 31);
         sysConfig.sta_ssid[31] = '\0';
-        if (pw && strlen(pw) > 0) {
-            passChanged = (strcmp(sysConfig.sta_password, pw) != 0);
-            strncpy(sysConfig.sta_password, pw, 63);
-            sysConfig.sta_password[63] = '\0';
-        } else {
+        if (doc.containsKey("password") && doc["password"].is<const char*>()) {
+            const char* pw = doc["password"];
+            if (pw && strlen(pw) > 0) {
+                passChanged = (strcmp(sysConfig.sta_password, pw) != 0);
+                strncpy(sysConfig.sta_password, pw, 63);
+                sysConfig.sta_password[63] = '\0';
+            } else if (ssidChanged) {
+                passChanged = (sysConfig.sta_password[0] != '\0');
+                sysConfig.sta_password[0] = '\0';
+            }
+        } else if (ssidChanged) {
             passChanged = (sysConfig.sta_password[0] != '\0');
             sysConfig.sta_password[0] = '\0';
         }
@@ -3421,9 +3412,8 @@ void handleGetAP() {
     lastConnectionActivity = millis();
     char buffer[256];
     snprintf(buffer, sizeof(buffer),
-        "{\"ap_ssid\":\"%s\",\"ap_password\":\"%s\",\"ap_channel\":%d,\"ap_hidden\":%s}",
+        "{\"ap_ssid\":\"%s\",\"ap_password\":\"\",\"ap_channel\":%d,\"ap_hidden\":%s}",
         sysConfig.ap_ssid,
-        sysConfig.ap_password,
         extConfig.ap_channel,
         extConfig.ap_hidden ? "true" : "false"
     );
@@ -3656,7 +3646,13 @@ void handleAddGPIO() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
-    uint8_t newPin = doc["pin"];
+    int rawPin = doc["pin"] | -1;
+    if (rawPin < 0 || rawPin > 48) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Invalid pin (0-48)\"}");
+        return;
+    }
+    uint8_t newPin = (uint8_t)rawPin;
     if (gpioConfig.count >= MAX_RELAYS) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Maximum relays reached\"}");
         return;
