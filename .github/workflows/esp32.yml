@@ -29,8 +29,10 @@ jobs:
         # Install libraries
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "PubSubClient"
-        git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
-
+        # git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
+        git clone --depth 1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
+        
+        
         # Compile firmware
         mv *.ino arduino.ino
         arduino-cli compile --fqbn esp32:esp32:esp32 --clean --output-dir firmware .
