@@ -16,6 +16,8 @@
 #include <ESPmDNS.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <PubSubClient.h>
+#include <strings.h>
 
 // =============================================================================
 //  Preferences (NVS)
@@ -24,7 +26,7 @@ Preferences preferences;
 #define NVS_NAMESPACE "relay16"
 #define EEPROM_MAGIC   0x1234
 #define EEPROM_VERSION 13
-#define EXT_CFG_MAGIC  0xEC
+#define EXT_CFG_MAGIC  0xED
 #define RELAY_CONFIG_MAGIC 0x1CE5
 
 // =============================================================================
@@ -144,7 +146,6 @@ const byte       DNS_PORT = 53;
 //  Relay Config
 // =============================================================================
 #define MAX_RELAYS 16
-// change gpio
 const uint8_t DEFAULT_RELAY_PINS[] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
 
 // =============================================================================
@@ -199,7 +200,17 @@ struct ExtConfig {
     uint8_t ap_hidden;
     uint8_t global_active_mode;
     uint8_t sta_enabled;
-    uint8_t reserved[26];
+    uint8_t mqtt_enabled;
+    uint8_t mqtt_ha_discovery;
+    uint8_t mqtt_retain;
+    uint8_t mqtt_qos;
+    uint16_t mqtt_port;
+    char     mqtt_broker[64];
+    char     mqtt_username[32];
+    char     mqtt_password[64];
+    char     mqtt_client_id[32];
+    char     mqtt_base_topic[48];
+    uint8_t reserved[6];
 } __attribute__((packed));
 
 // =============================================================================
@@ -261,6 +272,29 @@ unsigned long scanStartTime   = 0;
 // mDNS
 bool          mdnsStarted           = false;
 char          mdnsHostname[32]      = MDNS_HOSTNAME_DEFAULT;
+
+// =============================================================================
+//  MQTT
+// =============================================================================
+WiFiClient   mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+
+static bool          mqttConnected              = false;
+static unsigned long lastMqttReconnectAttempt   = 0;
+static unsigned long lastMqttPublish            = 0;
+static unsigned long lastMqttDiscovery          = 0;
+static unsigned long mqttBackoffUntil           = 0;
+static uint8_t       mqttReconnectAttempts      = 0;
+
+static const unsigned long MQTT_RECONNECT_INTERVAL = 5000UL;
+static const unsigned long MQTT_PUBLISH_INTERVAL   = 1000UL;
+static const unsigned long MQTT_DISCOVERY_INTERVAL = 300000UL;
+static const uint8_t       MQTT_MAX_RECONNECT      = 10;
+
+static char mqttTopicRelayCmd[MAX_RELAYS][64];
+static char mqttTopicRelayState[MAX_RELAYS][64];
+static char mqttTopicSystemCmd[64];
+static char mqttTopicSystemState[64];
 
 // =============================================================================
 //  Schedule Engine
@@ -348,6 +382,26 @@ void startNTPRequest(const char* server);
 void processNTPResponse();
 void updateNTPSync();
 float getRTCTemperature();
+
+// MQTT forward declarations
+void setupMQTT();
+void mqttBuildTopics();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+bool mqttReconnect();
+void mqttPublishRelayState(uint8_t index);
+void mqttPublishAllRelayStates();
+void mqttPublishSystemState();
+void mqttPublishDiscovery();
+void mqttPublishSingleDiscovery(uint8_t index);
+void mqttHandleRelayCommand(uint8_t index, const char* payload);
+void mqttHandleSystemCommand(const char* payload);
+void processMQTT();
+void mqttNotifyRelayChange(uint8_t index);
+void mqttGracefulDisconnect();
+void handleGetMQTT();
+void handleSaveMQTT();
+void handleMQTTReconnect();
+void handleMQTTPublishDiscovery();
 
 // =============================================================================
 //  64-bit Conversion Helpers
@@ -457,6 +511,382 @@ inline void setRelayOutput(uint8_t index, bool state) {
 }
 
 // =============================================================================
+//  MQTT IMPLEMENTATION
+// =============================================================================
+void mqttBuildTopics() {
+    const char* base = strlen(extConfig.mqtt_base_topic) > 0
+        ? extConfig.mqtt_base_topic
+        : "esp32/relay16";
+
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        snprintf(mqttTopicRelayCmd[i],   sizeof(mqttTopicRelayCmd[i]),
+                 "%s/relay/%d/set",   base, i + 1);
+        snprintf(mqttTopicRelayState[i], sizeof(mqttTopicRelayState[i]),
+                 "%s/relay/%d/state", base, i + 1);
+    }
+    snprintf(mqttTopicSystemCmd,   sizeof(mqttTopicSystemCmd),
+             "%s/system/set",   base);
+    snprintf(mqttTopicSystemState, sizeof(mqttTopicSystemState),
+             "%s/system/state", base);
+}
+
+void mqttGracefulDisconnect() {
+    if (mqttClient.connected()) {
+        if (strlen(mqttTopicSystemState) > 0) {
+            mqttClient.publish(mqttTopicSystemState, "offline", true);
+        }
+        mqttClient.loop();
+        delay(30);
+        mqttClient.disconnect();
+    }
+    mqttConnected = false;
+}
+
+void setupMQTT() {
+    if (!extConfig.mqtt_enabled) return;
+
+    mqttBuildTopics();
+    mqttClient.setServer(
+        strlen(extConfig.mqtt_broker) > 0 ? extConfig.mqtt_broker : "",
+        extConfig.mqtt_port > 0 ? extConfig.mqtt_port : 1883);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setBufferSize(1024);
+    mqttClient.setKeepAlive(60);
+    mqttClient.setSocketTimeout(10);
+
+    lastMqttReconnectAttempt = 0;
+    mqttReconnectAttempts    = 0;
+    mqttBackoffUntil         = 0;
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    if (!extConfig.mqtt_enabled) return;
+
+    char msg[128];
+    if (length >= sizeof(msg)) length = sizeof(msg) - 1;
+    memcpy(msg, payload, length);
+    msg[length] = '\0';
+
+    char* start = msg;
+    while (*start && isspace((unsigned char)*start)) start++;
+    char* end = start + strlen(start);
+    while (end > start && isspace((unsigned char)*(end - 1))) end--;
+    *end = '\0';
+
+    for (int i = 0; i < gpioConfig.count; i++) {
+        if (strcmp(topic, mqttTopicRelayCmd[i]) == 0) {
+            mqttHandleRelayCommand((uint8_t)i, start);
+            return;
+        }
+    }
+    if (strcmp(topic, mqttTopicSystemCmd) == 0) {
+        mqttHandleSystemCommand(start);
+    }
+}
+
+void mqttHandleRelayCommand(uint8_t index, const char* payload) {
+    if (!extConfig.mqtt_enabled) return;
+    if (index >= gpioConfig.count) return;
+
+    bool state;
+    if (strcasecmp(payload, "ON") == 0 || strcmp(payload, "1") == 0 ||
+        strcasecmp(payload, "true") == 0) {
+        state = true;
+    } else if (strcasecmp(payload, "OFF") == 0 || strcmp(payload, "0") == 0 ||
+               strcasecmp(payload, "false") == 0) {
+        state = false;
+    } else if (strcasecmp(payload, "AUTO") == 0) {
+        relayConfigs[index].manualOverride = false;
+        updateScheduleCache();
+        bool shouldBeOn = scheduleActiveCache[index];
+        setRelayOutput(index, shouldBeOn);
+        lastRelayOutputs[index] = shouldBeOn;
+        lastDebouncedStateGlobal[index] = shouldBeOn;
+        lastStateChangeGlobal[index] = millis();
+        saveConfiguration();
+        mqttPublishRelayState(index);
+        return;
+    } else if (strcasecmp(payload, "TOGGLE") == 0) {
+        state = !lastRelayOutputs[index];
+    } else {
+        return;
+    }
+
+    relayConfigs[index].manualOverride = true;
+    relayConfigs[index].manualState    = state;
+    scheduleActiveCache[index]         = false;
+    setRelayOutput(index, state);
+    lastRelayOutputs[index]            = state;
+    lastDebouncedStateGlobal[index]    = state;
+    lastStateChangeGlobal[index]       = millis();
+    saveConfiguration();
+    mqttPublishRelayState(index);
+}
+
+void mqttHandleSystemCommand(const char* payload) {
+    if (!extConfig.mqtt_enabled) return;
+
+    if (strcasecmp(payload, "STATUS") == 0) {
+        mqttPublishSystemState();
+        mqttPublishAllRelayStates();
+    } else if (strcasecmp(payload, "RESTART") == 0) {
+        mqttPublishSystemState();
+        mqttClient.loop();
+        delay(50);
+        mqttGracefulDisconnect();
+        delay(50);
+        ESP.restart();
+    } else if (strcasecmp(payload, "FACTORY_RESET") == 0) {
+        mqttGracefulDisconnect();
+        delay(50);
+        preferences.begin(NVS_NAMESPACE, false);
+        preferences.clear();
+        preferences.end();
+        delay(100);
+        ESP.restart();
+    } else if (strcasecmp(payload, "DISCOVERY") == 0) {
+        mqttPublishDiscovery();
+    } else if (strcasecmp(payload, "SYNC_TIME") == 0) {
+        if (wifiConnected && extConfig.sta_enabled) {
+            lastNTPSync    = 0;
+            lastNTPAttempt = 0;
+        }
+    }
+}
+
+bool mqttReconnect() {
+    if (!extConfig.mqtt_enabled)             return false;
+    if (!wifiConnected)                      return false;
+    if (strlen(extConfig.mqtt_broker) == 0)  return false;
+    if (mqttClient.connected())              return true;
+
+    unsigned long now = millis();
+
+    if (mqttBackoffUntil != 0) {
+        if (!isTimeReached(now, mqttBackoffUntil)) {
+            return false;
+        }
+        mqttBackoffUntil = 0;
+        mqttReconnectAttempts = 0;
+    }
+
+    if (!timeHasElapsed(now, lastMqttReconnectAttempt, MQTT_RECONNECT_INTERVAL)) {
+        return false;
+    }
+    lastMqttReconnectAttempt = now;
+
+    if (strlen(extConfig.mqtt_client_id) == 0) {
+        snprintf(extConfig.mqtt_client_id, sizeof(extConfig.mqtt_client_id),
+                 "esp32relay16_%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+    }
+
+    bool ok;
+    if (strlen(extConfig.mqtt_username) > 0) {
+        ok = mqttClient.connect(
+            extConfig.mqtt_client_id,
+            extConfig.mqtt_username,
+            extConfig.mqtt_password,
+            mqttTopicSystemState, 1, true, "offline");
+    } else {
+        ok = mqttClient.connect(
+            extConfig.mqtt_client_id,
+            mqttTopicSystemState, 1, true, "offline");
+    }
+
+    if (!ok) {
+        mqttReconnectAttempts++;
+        if (mqttReconnectAttempts >= MQTT_MAX_RECONNECT) {
+            mqttBackoffUntil = now + 300000UL;
+            mqttReconnectAttempts = 0;
+        }
+        return false;
+    }
+
+    mqttConnected          = true;
+    mqttReconnectAttempts  = 0;
+    mqttBackoffUntil       = 0;
+
+    for (int i = 0; i < gpioConfig.count; i++) {
+        mqttClient.publish(mqttTopicRelayCmd[i], "", true);
+    }
+    mqttClient.publish(mqttTopicSystemCmd, "", true);
+    delay(20);
+
+    for (int i = 0; i < gpioConfig.count; i++) {
+        mqttClient.subscribe(mqttTopicRelayCmd[i], extConfig.mqtt_qos);
+    }
+    mqttClient.subscribe(mqttTopicSystemCmd, extConfig.mqtt_qos);
+    mqttClient.publish(mqttTopicSystemState, "online", true);
+
+    if (extConfig.mqtt_ha_discovery) mqttPublishDiscovery();
+    mqttPublishAllRelayStates();
+    mqttPublishSystemState();
+    return true;
+}
+
+void mqttPublishRelayState(uint8_t index) {
+    if (!mqttConnected || index >= gpioConfig.count) return;
+
+    const char* state = lastRelayOutputs[index] ? "ON" : "OFF";
+    const char* mode  = relayConfigs[index].manualOverride ? "manual" : "auto";
+
+    mqttClient.publish(mqttTopicRelayState[index], state, extConfig.mqtt_retain);
+
+    char jsonTopic[96];
+    snprintf(jsonTopic, sizeof(jsonTopic), "%s/json", mqttTopicRelayState[index]);
+
+    char json[160];
+    snprintf(json, sizeof(json),
+             "{\"state\":\"%s\",\"mode\":\"%s\",\"pin\":%d,\"name\":\"%s\"}",
+             state, mode, getRelayPin(index), relayConfigs[index].name);
+    mqttClient.publish(jsonTopic, json, extConfig.mqtt_retain);
+}
+
+void mqttPublishAllRelayStates() {
+    if (!mqttConnected) return;
+    for (int i = 0; i < gpioConfig.count; i++) {
+        mqttPublishRelayState((uint8_t)i);
+    }
+}
+
+void mqttPublishSystemState() {
+    if (!mqttConnected) return;
+
+    DynamicJsonDocument doc(640);
+    doc["status"]        = "online";
+    doc["uptime"]        = (uint64_t)(esp_timer_get_time() / 1000000ULL);
+    doc["freeHeap"]      = ESP.getFreeHeap();
+    doc["wifiConnected"] = wifiConnected;
+    doc["wifiSSID"]      = sysConfig.sta_ssid;
+    doc["rssi"]          = wifiConnected ? (int)WiFi.RSSI() : 0;
+    doc["ip"]            = WiFi.localIP().toString();
+    doc["apIP"]          = WiFi.softAPIP().toString();
+    doc["relayCount"]    = gpioConfig.count;
+    doc["version"]       = EEPROM_VERSION;
+
+    uint64_t epoch = getCurrentEpoch();
+    if (epoch > MIN_UNIX_TIME_64) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%llu", (unsigned long long)epoch);
+        doc["utcEpoch"] = buf;
+    } else {
+        doc["utcEpoch"] = nullptr;
+    }
+
+    const char* ts = "none";
+    if      (timeSource == TIME_SOURCE_NTP)     ts = "ntp";
+    else if (timeSource == TIME_SOURCE_BROWSER) ts = "browser";
+    else if (timeSource == TIME_SOURCE_RTC)     ts = "rtc";
+    doc["timeSource"] = ts;
+
+    doc["rtcPresent"] = rtcPresent;
+    doc["rtcValid"]   = rtcTimeValid;
+
+    String json;
+    serializeJson(doc, json);
+    mqttClient.publish(mqttTopicSystemState, json.c_str(), extConfig.mqtt_retain);
+}
+
+void mqttPublishSingleDiscovery(uint8_t index) {
+    if (!mqttConnected || index >= gpioConfig.count) return;
+
+    char topic[128];
+    char payload[768];
+
+    snprintf(topic, sizeof(topic),
+             "homeassistant/switch/esp32relay16_%d/config", index);
+
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"%s\","
+        "\"uniq_id\":\"esp32relay16_%d\","
+        "\"cmd_t\":\"%s\","
+        "\"stat_t\":\"%s\","
+        "\"avty_t\":\"%s\","
+        "\"pl_on\":\"ON\",\"pl_off\":\"OFF\","
+        "\"stat_on\":\"ON\",\"stat_off\":\"OFF\","
+        "\"ret\":true,\"qos\":%d,"
+        "\"dev\":{\"ids\":\"esp32relay16\",\"name\":\"ESP32 16CH Relay\","
+        "\"mdl\":\"ESP32-38P\",\"sw\":\"%d\",\"mf\":\"Raff Alds\"}}",
+        relayConfigs[index].name,
+        index,
+        mqttTopicRelayCmd[index],
+        mqttTopicRelayState[index],
+        mqttTopicSystemState,
+        extConfig.mqtt_qos,
+        EEPROM_VERSION);
+
+    mqttClient.publish(topic, payload, true);
+}
+
+void mqttPublishDiscovery() {
+    if (!mqttConnected || !extConfig.mqtt_ha_discovery) return;
+
+    char topic[128];
+    char payload[512];
+
+    snprintf(topic, sizeof(topic),
+             "homeassistant/sensor/esp32relay16_status/config");
+    snprintf(payload, sizeof(payload),
+        "{\"name\":\"Status\",\"uniq_id\":\"esp32relay16_status\","
+        "\"stat_t\":\"%s\",\"val_tpl\":\"{{value_json.status}}\","
+        "\"json_attr_t\":\"%s\",\"avty_t\":\"%s\","
+        "\"dev\":{\"ids\":\"esp32relay16\",\"name\":\"ESP32 16CH Relay\","
+        "\"mdl\":\"ESP32-38P\",\"sw\":\"%d\",\"mf\":\"Raff Alds\"}}",
+        mqttTopicSystemState, mqttTopicSystemState, mqttTopicSystemState,
+        EEPROM_VERSION);
+    mqttClient.publish(topic, payload, true);
+
+    for (int i = 0; i < gpioConfig.count; i++) {
+        mqttPublishSingleDiscovery((uint8_t)i);
+    }
+    lastMqttDiscovery = millis();
+}
+
+void mqttNotifyRelayChange(uint8_t index) {
+    if (mqttConnected && index < gpioConfig.count) {
+        mqttPublishRelayState(index);
+    }
+}
+
+void processMQTT() {
+    if (!extConfig.mqtt_enabled) {
+        if (mqttConnected || mqttClient.connected()) {
+            mqttClient.disconnect();
+            mqttConnected = false;
+        }
+        return;
+    }
+
+    if (!wifiConnected) {
+        if (mqttConnected || mqttClient.connected()) {
+            mqttClient.disconnect();
+            mqttConnected = false;
+        }
+        return;
+    }
+
+    if (!mqttClient.connected()) {
+        mqttConnected = false;
+        mqttReconnect();
+        return;
+    }
+
+    mqttConnected = true;
+    mqttClient.loop();
+
+    unsigned long now = millis();
+    if (timeHasElapsed(now, lastMqttPublish, MQTT_PUBLISH_INTERVAL)) {
+        lastMqttPublish = now;
+        mqttPublishAllRelayStates();
+    }
+
+    if (extConfig.mqtt_ha_discovery &&
+        timeHasElapsed(now, lastMqttDiscovery, MQTT_DISCOVERY_INTERVAL)) {
+        mqttPublishDiscovery();
+    }
+}
+
+// =============================================================================
 //  Initialize Schedule Defaults
 // =============================================================================
 void initScheduleDefaults(int relayIndex) {
@@ -477,6 +907,7 @@ void setWiFiStationEnabled(bool enabled) {
     extConfig.sta_enabled = enabled ? 1 : 0;
     saveExtConfig();
     if (!enabled) {
+        mqttGracefulDisconnect();
         ntpUDP.stop();
         WiFi.disconnect(false, false);
         wifiConnected = false;
@@ -501,6 +932,10 @@ void setWiFiStationEnabled(bool enabled) {
             wifiReconnectAttempts = 0;
             wifiGiveUpUntil = 0;
         }
+        setupMQTT();
+        lastMqttReconnectAttempt = 0;
+        mqttReconnectAttempts = 0;
+        mqttBackoffUntil = 0;
     }
 }
 
@@ -843,6 +1278,11 @@ void SelfHealingSystem::performTargetedRecovery() {
     recoverRTC();
     verifyRelayStates(true);
     health.wifiFailures = 0;
+    if (extConfig.mqtt_enabled && !mqttConnected) {
+        lastMqttReconnectAttempt = 0;
+        mqttReconnectAttempts = 0;
+        mqttBackoffUntil = 0;
+    }
 }
 
 void SelfHealingSystem::verifyRelayStates(bool force) {
@@ -862,6 +1302,7 @@ void SelfHealingSystem::verifyRelayStates(bool force) {
         if (actualState != expectedLowState) {
             setRelayOutput(i, expectedState);
             lastRelayOutputs[i] = expectedState;
+            mqttNotifyRelayChange(i);
         }
     }
 }
@@ -1034,6 +1475,7 @@ const char index_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio">GPIO</a>
+<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
 </nav>
 <div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
@@ -1363,6 +1805,7 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio">GPIO</a>
+<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
 </nav>
 <div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
@@ -1603,6 +2046,7 @@ const char ntp_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp" class="cur">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio">GPIO</a>
+<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
 </nav>
 <div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
@@ -1736,6 +2180,7 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap" class="cur">AP</a>
 <a href="/gpio">GPIO</a>
+<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
 </nav>
 <div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
@@ -1807,6 +2252,7 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio" class="cur">GPIO</a>
+<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
 </nav>
 <div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
@@ -1857,7 +2303,6 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
 function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
-// change gpio
 const DEFAULT_PINS = [23,32,33,25,26,27,14,13,1,3,19,18,5,4,2,15];
 let gpioData = null;
 function saveGlobalMode() {
@@ -2009,6 +2454,266 @@ loadGPIO();
 </script></body></html>)raw";
 
 // =============================================================================
+//  MQTT PAGE
+// =============================================================================
+const char mqtt_html[] PROGMEM = R"raw(<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MQTT</title>
+<link rel="stylesheet" href="/style.css"></head><body>
+<header>
+<nav>
+<a href="/">Relays</a>
+<a href="/wifi">WiFi</a>
+<a href="/ntp">Time</a>
+<a href="/ap">AP</a>
+<a href="/gpio">GPIO</a>
+<a href="/mqtt" class="cur">MQTT</a>
+<a href="/system">System</a>
+</nav>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+</header>
+<main>
+<p class="ptitle">MQTT Settings</p>
+<div class="card fcrd">
+<div id="mqttStatus" class="alert ai" style="display:none;margin-bottom:12px"></div>
+
+<div class="fg">
+<label style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin-bottom:8px">
+<span style="font-size:14px;font-weight:600">MQTT Enabled</span>
+<button id="mqttToggleBtn" class="btn" style="min-width:90px;padding:8px 16px;font-weight:700;transition:all 0.2s" onclick="toggleMQTT()"></button>
+</label>
+<small>Enable MQTT to integrate with Home Assistant, Node-RED, or other automation systems. Requires WiFi Station Mode enabled.</small>
+</div>
+
+<hr>
+
+<div id="mqttConfig">
+<div class="fg">
+<label>Broker Address</label>
+<input type="text" id="broker" placeholder="192.168.1.100 or mqtt.example.com">
+</div>
+<div class="fg">
+<label>Port</label>
+<input type="number" id="port" value="1883" min="1" max="65535">
+<small>Default: 1883 (plain TCP). TLS (8883) is not supported.</small>
+</div>
+<div class="fg">
+<label>Username (optional)</label>
+<input type="text" id="username" placeholder="Leave empty for anonymous">
+</div>
+<div class="fg">
+<label>Password (optional)</label>
+<input type="password" id="password" placeholder="Leave empty for anonymous">
+</div>
+<div class="fg">
+<label>Client ID (optional)</label>
+<input type="text" id="client_id" placeholder="Auto-generated from MAC if empty">
+</div>
+<div class="fg">
+<label>Base Topic</label>
+<input type="text" id="base_topic" value="esp32/relay16">
+<small>Topics: &lt;base&gt;/relay/N/set, &lt;base&gt;/relay/N/state, &lt;base&gt;/system/set, &lt;base&gt;/system/state</small>
+</div>
+<div class="fg">
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+<input type="checkbox" id="ha_discovery" style="width:auto">
+<span>Enable Home Assistant Auto-Discovery</span>
+</label>
+</div>
+<div class="fg">
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+<input type="checkbox" id="retain" checked style="width:auto">
+<span>Retain Published Messages</span>
+</label>
+</div>
+<div class="fg">
+<label>QoS Level</label>
+<select id="qos">
+<option value="0">0 - At most once</option>
+<option value="1" selected>1 - At least once (recommended)</option>
+</select>
+<small>QoS 2 is not supported by the underlying client library.</small>
+</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button class="btn bsave" style="flex:1;min-width:140px" onclick="saveMQTT()">&#x1F4BE; Save Settings</button>
+<button class="btn bsync" style="flex:1;min-width:120px" onclick="reconnectMQTT()">&#x1F504; Reconnect</button>
+<button class="btn bwarn" style="flex:1;min-width:140px" onclick="publishDiscovery()">&#x1F3E0; Publish Discovery</button>
+</div>
+</div>
+
+<hr>
+<div class="fg">
+<label>Topic Reference</label>
+<div style="background:#FAFAFA;border:1px solid #CFD8DC;border-radius:7px;padding:12px;font-size:12px;font-family:monospace;line-height:1.8">
+<div><strong>Subscribe (commands):</strong></div>
+<div id="topicRef"></div>
+<div style="margin-top:8px"><strong>Publish (state):</strong></div>
+<div>&lt;base&gt;/relay/N/state → ON | OFF</div>
+<div>&lt;base&gt;/system/state → JSON status</div>
+<div style="margin-top:8px"><strong>Commands:</strong></div>
+<div>Relay: ON, OFF, TOGGLE, AUTO</div>
+<div>System: STATUS, RESTART, FACTORY_RESET, DISCOVERY, SYNC_TIME</div>
+</div>
+</div>
+</div>
+</main>
+<div id="toast"></div>
+<style>
+.btn-sta-on {
+    background: linear-gradient(135deg, #1565C0 0%, #0D47A1 100%);
+    color: #fff;
+    box-shadow: 0 2px 4px rgba(21,101,192,0.3);
+}
+.btn-sta-on:hover {
+    background: linear-gradient(135deg, #1E88E5 0%, #1565C0 100%);
+    filter: brightness(1.05);
+}
+.btn-sta-off {
+    background: linear-gradient(135deg, #C62828 0%, #B71C1C 100%);
+    color: #fff;
+    box-shadow: 0 2px 4px rgba(198,40,40,0.3);
+}
+.btn-sta-off:hover {
+    background: linear-gradient(135deg, #E53935 0%, #C62828 100%);
+    filter: brightness(1.05);
+}
+</style>
+<script>
+function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
+function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+setInterval(tick,1000);tick();
+
+function updateMQTTToggleBtn(enabled){
+  const btn=document.getElementById('mqttToggleBtn');
+  if(enabled){btn.textContent='✓ ON';btn.className='btn btn-sta-on';}
+  else{btn.textContent='✗ OFF';btn.className='btn btn-sta-off';}
+}
+
+function updateTopicRef(){
+  const base=document.getElementById('base_topic').value||'esp32/relay16';
+  const count=(gpioConfigCount>0)?gpioConfigCount:16;
+  if(base.startsWith('$')){
+    document.getElementById('topicRef').innerHTML =
+      '<div style="color:#C62828">⚠ Topics starting with "$" are reserved by the MQTT specification</div>';
+    return;
+  }
+  let html='';
+  for(let i=1;i<=count;i++){
+    html+='<div>&lt;'+base+'/relay/'+i+'/set&gt; → ON | OFF | TOGGLE | AUTO</div>';
+  }
+  html+='<div>&lt;'+base+'/system/set&gt; → STATUS | RESTART | FACTORY_RESET | DISCOVERY | SYNC_TIME</div>';
+  document.getElementById('topicRef').innerHTML=html;
+}
+
+let gpioConfigCount = 0;
+
+function loadMQTT(){
+  fetch('/api/mqtt').then(r=>r.json()).then(d=>{
+    document.getElementById('broker').value=d.broker||'';
+    document.getElementById('port').value=d.port||1883;
+    document.getElementById('username').value=d.username||'';
+    document.getElementById('client_id').value=d.client_id||'';
+    document.getElementById('base_topic').value=d.base_topic||'esp32/relay16';
+    document.getElementById('ha_discovery').checked=d.ha_discovery||false;
+    document.getElementById('retain').checked=d.retain!==false;
+    document.getElementById('qos').value=d.qos!==undefined?d.qos:1;
+    updateMQTTToggleBtn(d.enabled);
+    updateTopicRef();
+
+    const s=document.getElementById('mqttStatus');
+    s.style.display='block';
+    if(!d.enabled){
+      s.innerHTML='<span style="font-weight:700">⛔ MQTT Disabled</span><br>Enable MQTT above to connect to a broker.';
+      s.className='alert aw';
+    }else if(d.connected){
+      s.innerHTML='<span style="font-weight:700">✓ Connected</span> to <strong>'+d.broker+':'+d.port+'</strong>';
+      s.className='alert ai';
+    }else{
+      let msg='<span style="font-weight:700">⚠ Not Connected</span><br>Reconnect attempts: '+d.reconnect_attempts;
+      if(d.backoff_active){
+        msg+='<br><small>⏳ Backoff active — retry in ~5 minutes</small>';
+      }
+      s.innerHTML=msg;
+      s.className='alert aw';
+    }
+
+    const cfg=document.getElementById('mqttConfig');
+    cfg.style.opacity=d.enabled?'1':'0.5';
+    cfg.querySelectorAll('input,button,select').forEach(el=>el.disabled=!d.enabled);
+  }).catch(()=>{});
+}
+
+function toggleMQTT(){
+  const btn=document.getElementById('mqttToggleBtn');
+  const wasEnabled=btn.textContent==='✓ ON';
+  const willEnable=!wasEnabled;
+  btn.disabled=true;btn.textContent='...';
+  fetch('/api/mqtt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:willEnable})})
+  .then(r=>r.json()).then(d=>{
+    btn.disabled=false;
+    if(d.success){
+      toast(willEnable?'MQTT enabled':'MQTT disabled');
+      if(willEnable){
+        setTimeout(()=>{const el=document.getElementById('broker');if(el)el.focus();},100);
+      }
+      loadMQTT();
+    }else{
+      toast('Failed',false);
+      updateMQTTToggleBtn(wasEnabled);
+    }
+  }).catch(()=>{btn.disabled=false;toast('Error',false);updateMQTTToggleBtn(wasEnabled);});
+}
+
+function saveMQTT(){
+  const broker=document.getElementById('broker').value.trim();
+  if(!broker){toast('Broker address required',false);return;}
+  const portIn=parseInt(document.getElementById('port').value);
+  if(!portIn||portIn<1||portIn>65535){toast('Port must be 1-65535',false);return;}
+  const body={
+    broker:broker,
+    port:portIn,
+    username:document.getElementById('username').value.trim(),
+    password:document.getElementById('password').value,
+    client_id:document.getElementById('client_id').value.trim(),
+    base_topic:document.getElementById('base_topic').value.trim()||'esp32/relay16',
+    ha_discovery:document.getElementById('ha_discovery').checked,
+    retain:document.getElementById('retain').checked,
+    qos:parseInt(document.getElementById('qos').value)
+  };
+  fetch('/api/mqtt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  .then(r=>r.json()).then(d=>{
+    if(d.success){toast('MQTT settings saved!');loadMQTT();}
+    else toast('Failed: '+d.error,false);
+  }).catch(()=>toast('Error',false));
+}
+
+function reconnectMQTT(){
+  const broker=document.getElementById('broker').value.trim();
+  if(!broker){toast('Set broker address first',false);return;}
+  fetch('/api/mqtt/reconnect',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.success)toast('Reconnecting...');
+    else toast('Failed: '+d.error,false);
+  }).catch(()=>toast('Error',false));
+}
+
+function publishDiscovery(){
+  fetch('/api/mqtt/discovery',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.success)toast('Discovery published!');
+    else toast('Failed: '+d.error,false);
+  }).catch(()=>toast('Error',false));
+}
+
+fetch('/api/gpio').then(r=>r.json()).then(d=>{
+  gpioConfigCount = d.count || 0;
+  updateTopicRef();
+}).catch(()=>{});
+
+loadMQTT();
+setInterval(loadMQTT,5000);
+document.getElementById('base_topic').addEventListener('input',updateTopicRef);
+</script></body></html>)raw";
+
+// =============================================================================
 //  SYSTEM PAGE
 // =============================================================================
 const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
@@ -2022,6 +2727,7 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio">GPIO</a>
+<a href="/mqtt">MQTT</a>
 <a href="/system" class="cur">System</a>
 </nav>
 <div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
@@ -2050,6 +2756,8 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="ibox"><div class="l">DS3231 Temp</div><div class="v" id="srtctemp">&hellip;</div></div>
 <div class="ibox"><div class="l">Sync Direction</div><div class="v" id="ssyncdir" style="font-size:12px;color:#7B1FA2">&hellip;</div></div>
 <div class="ibox"><div class="l">WiFi Station</div><div class="v" id="stawifi">&hellip;</div></div>
+<div class="ibox"><div class="l">MQTT</div><div class="v" id="smqtt">&hellip;</div></div>
+<div class="ibox"><div class="l">MQTT Broker</div><div class="v" id="smqttbroker" style="font-size:12px">&hellip;</div></div>
 </div>
 
 <div class="card fcrd">
@@ -2128,6 +2836,17 @@ function loadSys(){
     if(d.staEnabled && d.wifiConnected) document.getElementById('stawifi').style.color='#2E7D32';
     else if(d.staEnabled) document.getElementById('stawifi').style.color='#F9A825';
     else document.getElementById('stawifi').style.color='#C62828';
+    let mqttStatus = '';
+    if(!d.mqttEnabled) mqttStatus = '❌ Disabled';
+    else if(d.mqttConnected) mqttStatus = '✅ Connected';
+    else if(d.mqttBackoff) mqttStatus = '⏳ Backoff';
+    else mqttStatus = '⚠️ Disconnected';
+    document.getElementById('smqtt').textContent = mqttStatus;
+    if(d.mqttEnabled && d.mqttConnected) document.getElementById('smqtt').style.color='#2E7D32';
+    else if(d.mqttEnabled && d.mqttBackoff) document.getElementById('smqtt').style.color='#F9A825';
+    else if(d.mqttEnabled) document.getElementById('smqtt').style.color='#F9A825';
+    else document.getElementById('smqtt').style.color='#C62828';
+    document.getElementById('smqttbroker').textContent = (d.mqttEnabled && d.mqttBroker) ? d.mqttBroker : '\u2014';
   }).catch(()=>{});
 }
 loadSys();setInterval(loadSys,5000);
@@ -2169,6 +2888,8 @@ void checkBootButton() {
     if (bootButtonPressed && !factoryResetTriggered &&
         timeHasElapsed(now, bootButtonPressStart, FACTORY_RESET_HOLD)) {
         factoryResetTriggered = true;
+        mqttGracefulDisconnect();
+        delay(100);
         preferences.begin(NVS_NAMESPACE, false);
         preferences.clear();
         preferences.end();
@@ -2189,7 +2910,6 @@ void loadGPIOConfig() {
                  (gpioConfig.count > 0) &&
                  (gpioConfig.count <= MAX_RELAYS);
     if (valid) {
-        // change gpio
         static const uint8_t SAFE_PINS[] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
         for (uint8_t i = 0; i < gpioConfig.count; i++) {
             bool allowed = false;
@@ -2246,6 +2966,7 @@ void syncInternalRTC(uint64_t rawUtcEpoch, uint8_t source) {
         saveRTCState();
     }
     updateScheduleCache();
+    if (mqttConnected) mqttPublishSystemState();
 }
 
 // =============================================================================
@@ -2478,6 +3199,7 @@ void handleBrowserTimeSync() {
         saveRTCState();
     }
     updateScheduleCache();
+    if (mqttConnected) mqttPublishSystemState();
     uint64_t localEpoch = getLocalEpoch(browserUtcEpoch);
     struct tm* ti = gmtime64(&localEpoch);
     char timeStr[20];
@@ -2622,6 +3344,7 @@ void processRelaySchedules() {
             if (lastRelayOutputs[i] != targetState) {
                 setRelayOutput(i, targetState);
                 lastRelayOutputs[i] = targetState;
+                mqttNotifyRelayChange(i);
             }
             lastDebouncedStateGlobal[i] = targetState;
             continue;
@@ -2641,11 +3364,13 @@ void processRelaySchedules() {
                 lastRelayOutputs[i] = shouldBeOn;
                 lastDebouncedStateGlobal[i] = shouldBeOn;
                 lastStateChangeGlobal[i] = now;
+                mqttNotifyRelayChange(i);
             }
         } else if (lastRelayOutputs[i] != shouldBeOn) {
             setRelayOutput(i, shouldBeOn);
             lastRelayOutputs[i] = shouldBeOn;
             lastStateChangeGlobal[i] = now;
+            mqttNotifyRelayChange(i);
         }
     }
 }
@@ -2773,6 +3498,7 @@ void setup() {
         dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
     }
     setupWebServer();
+    setupMQTT();
     updateScheduleCache();
     lastMemoryCleanup = millis();
     lastHeapCheck = millis();
@@ -2918,6 +3644,7 @@ void loop() {
         lastScheduleProcess = now;
         processRelaySchedules();
     }
+    processMQTT();
     yield();
 }
 
@@ -2993,6 +3720,16 @@ void loadExtConfig() {
         extConfig.ap_hidden          = 0;
         extConfig.global_active_mode = 0;
         extConfig.sta_enabled        = 1;
+        extConfig.mqtt_enabled       = 0;
+        extConfig.mqtt_ha_discovery  = 0;
+        extConfig.mqtt_retain        = 1;
+        extConfig.mqtt_qos           = 1;
+        extConfig.mqtt_port          = 1883;
+        extConfig.mqtt_broker[0]     = '\0';
+        extConfig.mqtt_username[0]   = '\0';
+        extConfig.mqtt_password[0]   = '\0';
+        extConfig.mqtt_client_id[0]  = '\0';
+        strcpy(extConfig.mqtt_base_topic, "esp32/relay16");
         saveExtConfig();
         return;
     }
@@ -3007,6 +3744,21 @@ void loadExtConfig() {
     }
     if (extConfig.sta_enabled > 1) {
         extConfig.sta_enabled = 1;
+    }
+    if (extConfig.mqtt_enabled > 1)       extConfig.mqtt_enabled = 0;
+    if (extConfig.mqtt_ha_discovery > 1)  extConfig.mqtt_ha_discovery = 0;
+    if (extConfig.mqtt_retain > 1)        extConfig.mqtt_retain = 1;
+    if (extConfig.mqtt_qos > 1)           extConfig.mqtt_qos = 1;
+    if (extConfig.mqtt_port == 0)         extConfig.mqtt_port = 1883;
+
+    extConfig.mqtt_broker    [sizeof(extConfig.mqtt_broker)    - 1] = '\0';
+    extConfig.mqtt_username  [sizeof(extConfig.mqtt_username)  - 1] = '\0';
+    extConfig.mqtt_password  [sizeof(extConfig.mqtt_password)  - 1] = '\0';
+    extConfig.mqtt_client_id [sizeof(extConfig.mqtt_client_id) - 1] = '\0';
+    extConfig.mqtt_base_topic[sizeof(extConfig.mqtt_base_topic)- 1] = '\0';
+
+    if (strlen(extConfig.mqtt_base_topic) == 0) {
+        strcpy(extConfig.mqtt_base_topic, "esp32/relay16");
     }
 }
 
@@ -3025,6 +3777,7 @@ void setupWebServer() {
     server.on("/ntp",    HTTP_GET, []() { server.send_P(200, "text/html", ntp_html);    });
     server.on("/ap",     HTTP_GET, []() { server.send_P(200, "text/html", ap_html);     });
     server.on("/gpio",   HTTP_GET, []() { server.send_P(200, "text/html", gpio_html);   });
+    server.on("/mqtt",   HTTP_GET, []() { server.send_P(200, "text/html", mqtt_html);   });
     server.on("/system", HTTP_GET, []() { server.send_P(200, "text/html", system_html); });
     server.on("/style.css", HTTP_GET, []() { server.send_P(200, "text/css", style_css); });
     server.on("/api/relays",       HTTP_GET,  handleGetRelays);
@@ -3053,6 +3806,10 @@ void setupWebServer() {
         "{\"mode\":" + String(extConfig.global_active_mode) + "}");
     });
     server.on("/api/gpio/global-mode",      HTTP_POST, handleGlobalActiveMode);
+    server.on("/api/mqtt",              HTTP_GET,  handleGetMQTT);
+    server.on("/api/mqtt",              HTTP_POST, handleSaveMQTT);
+    server.on("/api/mqtt/reconnect",    HTTP_POST, handleMQTTReconnect);
+    server.on("/api/mqtt/discovery",    HTTP_POST, handleMQTTPublishDiscovery);
     server.on("/api/system",        HTTP_GET,  handleGetSystem);
     server.on("/api/reset",         HTTP_POST, handleReset);
     server.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
@@ -3145,7 +3902,10 @@ void handleManualControl() {
         scheduleActiveCache[relay] = false;
         setRelayOutput(relay, state);
         lastRelayOutputs[relay] = state;
+        lastDebouncedStateGlobal[relay] = state;
+        lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
+        mqttNotifyRelayChange(relay);
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
@@ -3167,7 +3927,13 @@ void handleResetManual() {
     if (relay >= 0 && relay < gpioConfig.count) {
         relayConfigs[relay].manualOverride = false;
         updateScheduleCache();
+        bool shouldBeOn = scheduleActiveCache[relay];
+        setRelayOutput(relay, shouldBeOn);
+        lastRelayOutputs[relay] = shouldBeOn;
+        lastDebouncedStateGlobal[relay] = shouldBeOn;
+        lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
+        mqttNotifyRelayChange(relay);
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
@@ -3259,6 +4025,10 @@ void handleRelayName() {
         strncpy(relayConfigs[relay].name, name, 15);
         relayConfigs[relay].name[15] = '\0';
         saveConfiguration();
+        if (mqttConnected) {
+            if (extConfig.mqtt_ha_discovery) mqttPublishSingleDiscovery(relay);
+            mqttPublishRelayState(relay);
+        }
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid data\"}");
@@ -3365,6 +4135,10 @@ void handleSaveWiFi() {
         }
         saveConfiguration();
         if (extConfig.sta_enabled && (ssidChanged || passChanged)) {
+            mqttGracefulDisconnect();
+            lastMqttReconnectAttempt = 0;
+            mqttReconnectAttempts = 0;
+            mqttBackoffUntil = 0;
             wifiPausedForScan = false;
             WiFi.disconnect(false, false);
             delay(500);
@@ -3596,6 +4370,7 @@ void handleSaveAP() {
     saveExtConfig();
     bool needsRestart = ssidChanged || passChanged || channelChanged || hiddenChanged;
     if (needsRestart) {
+        mqttGracefulDisconnect();
         server.send(200, "application/json", "{\"success\":true,\"restarted\":true}");
         server.client().flush();
         delay(200);
@@ -3637,6 +4412,10 @@ void handleGetSystem() {
     doc["globalActiveMode"] = extConfig.global_active_mode;
     doc["rtcPresent"] = rtcPresent;
     doc["staEnabled"] = extConfig.sta_enabled ? true : false;
+    doc["mqttEnabled"]   = extConfig.mqtt_enabled ? true : false;
+    doc["mqttConnected"] = mqttConnected;
+    doc["mqttBroker"]    = extConfig.mqtt_broker;
+    doc["mqttBackoff"]   = (mqttBackoffUntil != 0);
     float rtcTempVal = getRTCTemperature();
     if (isnan(rtcTempVal)) {
         doc["rtcTemp"] = nullptr;
@@ -3658,11 +4437,208 @@ void handleFactoryReset() {
         "{\"success\":true,\"message\":\"Factory reset complete. Device will restart with default settings.\"}");
     server.client().flush();
     delay(500);
+    mqttGracefulDisconnect();
+    delay(100);
     preferences.begin(NVS_NAMESPACE, false);
     preferences.clear();
     preferences.end();
     delay(100);
     ESP.restart();
+}
+
+// =============================================================================
+//  MQTT API HANDLERS
+// =============================================================================
+void handleGetMQTT() {
+    DynamicJsonDocument doc(512);
+    doc["enabled"] = extConfig.mqtt_enabled ? true : false;
+    doc["broker"] = extConfig.mqtt_broker;
+    doc["port"] = extConfig.mqtt_port;
+    doc["username"] = extConfig.mqtt_username;
+    doc["password"] = "";
+    doc["client_id"] = extConfig.mqtt_client_id;
+    doc["base_topic"] = extConfig.mqtt_base_topic;
+    doc["ha_discovery"] = extConfig.mqtt_ha_discovery ? true : false;
+    doc["retain"] = extConfig.mqtt_retain ? true : false;
+    doc["qos"] = extConfig.mqtt_qos;
+    doc["connected"] = mqttConnected;
+    doc["reconnect_attempts"] = mqttReconnectAttempts;
+    doc["backoff_active"] = (mqttBackoffUntil != 0);
+    String resp;
+    serializeJson(doc, resp);
+    server.send(200, "application/json", resp);
+}
+
+void handleSaveMQTT() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+
+    bool changed = false;
+    bool reconnectNeeded = false;
+
+    if (doc.containsKey("enabled")) {
+        uint8_t newEnabled = doc["enabled"] ? 1 : 0;
+        if (newEnabled != extConfig.mqtt_enabled) {
+            extConfig.mqtt_enabled = newEnabled;
+            changed = true;
+            reconnectNeeded = true;
+        }
+    }
+
+    if (doc.containsKey("broker")) {
+        const char* broker = doc["broker"];
+        if (broker && strlen(broker) < sizeof(extConfig.mqtt_broker)) {
+            if (strcmp(extConfig.mqtt_broker, broker) != 0) {
+                strncpy(extConfig.mqtt_broker, broker, sizeof(extConfig.mqtt_broker) - 1);
+                extConfig.mqtt_broker[sizeof(extConfig.mqtt_broker) - 1] = '\0';
+                changed = true;
+                reconnectNeeded = true;
+            }
+        }
+    }
+
+    if (doc.containsKey("port")) {
+        int32_t portIn = doc["port"] | 0;
+        if (portIn < 1 || portIn > 65535) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Port must be 1-65535\"}");
+            return;
+        }
+        if ((uint16_t)portIn != extConfig.mqtt_port) {
+            extConfig.mqtt_port = (uint16_t)portIn;
+            changed = true;
+            reconnectNeeded = true;
+        }
+    }
+
+    if (doc.containsKey("username")) {
+        const char* user = doc["username"];
+        if (user && strlen(user) < sizeof(extConfig.mqtt_username)) {
+            if (strcmp(extConfig.mqtt_username, user) != 0) {
+                strncpy(extConfig.mqtt_username, user, sizeof(extConfig.mqtt_username) - 1);
+                extConfig.mqtt_username[sizeof(extConfig.mqtt_username) - 1] = '\0';
+                changed = true;
+                reconnectNeeded = true;
+            }
+        }
+    }
+
+    if (doc.containsKey("password")) {
+        const char* pw = doc["password"];
+        if (pw && strlen(pw) < sizeof(extConfig.mqtt_password)) {
+            if (strcmp(extConfig.mqtt_password, pw) != 0) {
+                strncpy(extConfig.mqtt_password, pw, sizeof(extConfig.mqtt_password) - 1);
+                extConfig.mqtt_password[sizeof(extConfig.mqtt_password) - 1] = '\0';
+                changed = true;
+                reconnectNeeded = true;
+            }
+        }
+    }
+
+    if (doc.containsKey("client_id")) {
+        const char* cid = doc["client_id"];
+        if (cid && strlen(cid) < sizeof(extConfig.mqtt_client_id)) {
+            if (strcmp(extConfig.mqtt_client_id, cid) != 0) {
+                strncpy(extConfig.mqtt_client_id, cid, sizeof(extConfig.mqtt_client_id) - 1);
+                extConfig.mqtt_client_id[sizeof(extConfig.mqtt_client_id) - 1] = '\0';
+                changed = true;
+                reconnectNeeded = true;
+            }
+        }
+    }
+
+    if (doc.containsKey("base_topic")) {
+        const char* bt = doc["base_topic"];
+        if (bt && strlen(bt) > 0 &&
+            strlen(bt) < sizeof(extConfig.mqtt_base_topic) - 16) {
+            if (strcmp(extConfig.mqtt_base_topic, bt) != 0) {
+                strncpy(extConfig.mqtt_base_topic, bt, sizeof(extConfig.mqtt_base_topic) - 1);
+                extConfig.mqtt_base_topic[sizeof(extConfig.mqtt_base_topic) - 1] = '\0';
+                changed = true;
+                reconnectNeeded = true;
+            }
+        }
+    }
+
+    if (doc.containsKey("ha_discovery")) {
+        uint8_t newDisc = doc["ha_discovery"] ? 1 : 0;
+        if (newDisc != extConfig.mqtt_ha_discovery) {
+            extConfig.mqtt_ha_discovery = newDisc;
+            changed = true;
+        }
+    }
+
+    if (doc.containsKey("retain")) {
+        uint8_t newRetain = doc["retain"] ? 1 : 0;
+        if (newRetain != extConfig.mqtt_retain) {
+            extConfig.mqtt_retain = newRetain;
+            changed = true;
+        }
+    }
+
+    if (doc.containsKey("qos")) {
+        int32_t q = doc["qos"] | 1;
+        if (q > 1) q = 1;
+        if (q < 0) q = 0;
+        uint8_t newQos = (uint8_t)q;
+        if (newQos != extConfig.mqtt_qos) {
+            extConfig.mqtt_qos = newQos;
+            changed = true;
+            reconnectNeeded = true;
+        }
+    }
+
+    if (!changed) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No changes\"}");
+        return;
+    }
+
+    saveExtConfig();
+
+    if (extConfig.mqtt_enabled) {
+        mqttGracefulDisconnect();
+        setupMQTT();
+        lastMqttReconnectAttempt = 0;
+        mqttReconnectAttempts = 0;
+        mqttBackoffUntil = 0;
+    } else {
+        mqttGracefulDisconnect();
+        mqttClient.setServer("", 0);
+    }
+
+    server.send(200, "application/json", "{\"success\":true}");
+}
+
+void handleMQTTReconnect() {
+    if (!extConfig.mqtt_enabled) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"MQTT is disabled\"}");
+        return;
+    }
+    mqttClient.disconnect();
+    mqttConnected = false;
+    lastMqttReconnectAttempt = 0;
+    mqttReconnectAttempts = 0;
+    mqttBackoffUntil = 0;
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Reconnecting...\"}");
+}
+
+void handleMQTTPublishDiscovery() {
+    if (!mqttConnected) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"MQTT not connected\"}");
+        return;
+    }
+    mqttPublishDiscovery();
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Discovery published\"}");
 }
 
 // =============================================================================
@@ -3704,7 +4680,6 @@ void handleSaveGPIOConfig() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Too many pins\"}");
         return;
     }
-    // change gpio
     static const uint8_t SAFE_PINS[] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
     uint8_t parsed[MAX_RELAYS] = {0};
     uint8_t pi = 0;
@@ -3777,6 +4752,14 @@ void handleSaveGPIOConfig() {
     saveGPIOConfig();
     saveConfiguration();
     updateScheduleCache();
+    mqttBuildTopics();
+    if (mqttConnected) {
+        mqttClient.disconnect();
+        mqttConnected = false;
+        lastMqttReconnectAttempt = 0;
+        mqttReconnectAttempts = 0;
+        mqttBackoffUntil = 0;
+    }
     server.send(200, "application/json", "{\"success\":true,\"count\":" + String(newCount) + "}");
 }
 
@@ -3798,7 +4781,6 @@ void handleAddGPIO() {
         return;
     }
     uint8_t newPin = (uint8_t)rawPin;
-    // change gpio
     static const uint8_t SAFE_PINS[] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
     bool pinAllowed = false;
     for (uint8_t sp : SAFE_PINS) {
@@ -3831,6 +4813,14 @@ void handleAddGPIO() {
     saveGPIOConfig();
     saveConfiguration();
     updateScheduleCache();
+    mqttBuildTopics();
+    if (mqttConnected) {
+        mqttClient.disconnect();
+        mqttConnected = false;
+        lastMqttReconnectAttempt = 0;
+        mqttReconnectAttempts = 0;
+        mqttBackoffUntil = 0;
+    }
     server.send(200, "application/json", "{\"success\":true,\"count\":" + String(gpioConfig.count) + "}");
 }
 
@@ -3851,6 +4841,13 @@ void handleDeleteGPIO() {
         return;
     }
     setRelayOutput(index, false);
+    if (mqttConnected && extConfig.mqtt_ha_discovery) {
+        char emptyTopic[128];
+        snprintf(emptyTopic, sizeof(emptyTopic),
+                 "homeassistant/switch/esp32relay16_%d/config",
+                 gpioConfig.count - 1);
+        mqttClient.publish(emptyTopic, "", true);
+    }
     for (uint8_t i = index; i < gpioConfig.count - 1; i++) {
         gpioConfig.pins[i] = gpioConfig.pins[i + 1];
         gpioConfig.activeLow[i] = gpioConfig.activeLow[i + 1];
@@ -3870,6 +4867,14 @@ void handleDeleteGPIO() {
     saveGPIOConfig();
     saveConfiguration();
     updateScheduleCache();
+    mqttBuildTopics();
+    if (mqttConnected) {
+        mqttClient.disconnect();
+        mqttConnected = false;
+        lastMqttReconnectAttempt = 0;
+        mqttReconnectAttempts = 0;
+        mqttBackoffUntil = 0;
+    }
     server.send(200, "application/json", "{\"success\":true,\"count\":" + String(gpioConfig.count) + "}");
 }
 
@@ -3895,6 +4900,7 @@ void handleToggleActiveLow() {
     pinMode(gpioConfig.pins[index], OUTPUT);
     setRelayOutput(index, logicalState);
     lastRelayOutputs[index] = logicalState;
+    mqttNotifyRelayChange(index);
     server.send(200, "application/json",
         "{\"success\":true,\"activeLow\":" + String(gpioConfig.activeLow[index] ? "true" : "false") + "}");
 }
@@ -3924,6 +4930,7 @@ void handleGlobalActiveMode() {
         bool currentState = lastRelayOutputs[i];
         setRelayOutput(i, currentState);
     }
+    mqttPublishAllRelayStates();
     server.send(200, "application/json",
         "{\"success\":true,\"mode\":" + String(mode) + "}");
 }
