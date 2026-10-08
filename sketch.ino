@@ -398,6 +398,7 @@ void initScheduleDefaults(int relayIndex);
 void startNTPRequest(const char* server);
 void processNTPResponse();
 void updateNTPSync();
+void tryNTPSync();
 float getRTCTemperature();
 void loadMqttConfig();
 void saveMqttConfig();
@@ -559,7 +560,7 @@ void forceFlushNvs() {
 // =============================================================================
 //  MQTT Topic Helpers
 // =============================================================================
-static inline void sanitizeBaseTopic(char* buf, size_t len) {
+void sanitizeBaseTopic(char* buf, size_t len) {
     if (!buf || len == 0) return;
     size_t n = strnlen(buf, len);
     while (n > 0 && buf[n - 1] == '/') buf[--n] = '\0';
@@ -569,7 +570,7 @@ static inline void sanitizeBaseTopic(char* buf, size_t len) {
     }
 }
 
-static inline void mqttTopicBuf(char* out, size_t outLen, const char* fmt, ...) {
+void mqttTopicBuf(char* out, size_t outLen, const char* fmt, ...) {
     if (!out || outLen == 0) return;
     int n = snprintf(out, outLen, "%s/", mqttCfg.base_topic);
     if (n < 0) { out[0] = '\0'; return; }
