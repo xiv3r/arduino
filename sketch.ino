@@ -661,12 +661,12 @@ void setWiFiStationEnabled(bool enabled) {
         wifiPausedForScan = false;
         wifiReconnectAttempts = 0;
         wifiGiveUpUntil = 0;
-        WiFi.mode(WIFI_AP);
+        if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
+            WiFi.mode(WIFI_AP_STA);
+        }
         ntpAsyncState = NTP_STATE_IDLE;
         ntpAsyncStage = 0;
-        ntpRetryCount = 0;
         lastNTPSync = 0;
-        lastNTPAttempt = 0;
     } else {
         if (WiFi.getMode() != WIFI_AP_STA) {
             WiFi.mode(WIFI_AP_STA);
@@ -972,6 +972,10 @@ void SelfHealingSystem::restartAPIfNeeded(bool forceRestart) {
             delay(100);
             dnsServer.stop();
             dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+            if (mdnsStarted) {
+                MDNS.end();
+                mdnsStarted = false;
+            }
             lastMDNSReconfigure = millis() - 60000UL;
             liveReconfigureMDNS();
         } else {
@@ -983,6 +987,10 @@ void SelfHealingSystem::restartAPIfNeeded(bool forceRestart) {
             delay(100);
             dnsServer.stop();
             dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+            if (mdnsStarted) {
+                MDNS.end();
+                mdnsStarted = false;
+            }
             lastMDNSReconfigure = millis() - 60000UL;
             liveReconfigureMDNS();
         }
@@ -1259,7 +1267,7 @@ function fetchWithTimeout(url, options = {}, timeout = 10000) {
 }
 
 function tick(){
-  fetchWithTimeout('/api/time').then(r=>r.json()).then(d=>{
+  fetchWithTimeout('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
     document.getElementById('clk').textContent=d.time||'--:--:--';
     const de=document.getElementById('date');
     if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');
@@ -1268,8 +1276,8 @@ function tick(){
     if(t){
       let tc='y';
       if(d.timeSource==='ntp')tc='g';
-      else if(d.timeSource==='browser')tc='b';
-      else if(d.timeSource==='rtc')tc='b';
+      else if(d.timeSource==='browser')tc='y';
+      else if(d.timeSource==='rtc')tc='g';
       else tc='y';
       t.className='dot '+tc;
     }
@@ -1279,38 +1287,10 @@ setInterval(tick,1000);tick();
 
 const NS=8;
 let relays=[],busy=false;
+let loadInFlight = false;
 let editingRelay = -1;
 let editingInput = null;
 let editSuppressBlur = false;
-let nameSeq = {};
-
-function utf8ByteLength(str) {
-  let bytes = 0;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    if (c < 0x80) bytes += 1;
-    else if (c < 0x800) bytes += 2;
-    else if (c >= 0xD800 && c <= 0xDBFF) { bytes += 4; i++; }
-    else bytes += 3;
-  }
-  return bytes;
-}
-
-function truncateUtf8(str, maxBytes) {
-  let bytes = 0;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    let cb;
-    if (c < 0x80) cb = 1;
-    else if (c < 0x800) cb = 2;
-    else if (c >= 0xD800 && c <= 0xDBFF) cb = 4;
-    else cb = 3;
-    if (bytes + cb > maxBytes) return str.substring(0, i);
-    bytes += cb;
-    if (cb === 4) i++;
-  }
-  return str;
-}
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -1320,20 +1300,24 @@ function escapeHtml(text) {
 
 function load(){
   if(busy)return;
+  if(loadInFlight)return;
+  loadInFlight = true;
   const g=document.getElementById('grid');
   if(g && relays.length === 0) {
     g.innerHTML = '<div class="card" style="text-align:center;padding:40px"><p style="color:#90A4AE">&#x23F3; Loading relays...</p></div>';
   }
   fetchWithTimeout('/api/relays').then(r=>r.json()).then(d=>{
+    loadInFlight = false;
     if(!Array.isArray(d)){toast('Load error',false);if(g)g.innerHTML='';return;}
     d=d.filter(r=>r&&typeof r==='object');
     d.forEach(r=>{
       if(!Array.isArray(r.schedules))r.schedules=[];
       r.schedules=r.schedules.filter(s=>s&&typeof s==='object');
+      if(r.schedules.length > NS) r.schedules = r.schedules.slice(0, NS);
       while(r.schedules.length<NS)r.schedules.push({startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF});
     });
     relays=d;render();
-  }).catch(()=>{toast('Load error',false);if(g)g.innerHTML='';});
+  }).catch(()=>{loadInFlight = false; toast('Load error',false); if(g)g.innerHTML='';});
 }
 
 function toTS(h,m,s){return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
@@ -1357,7 +1341,8 @@ function monthDayMaskToStr(md){
 
 function monthMaskToStr(mm) {
   if (mm === 0x0FFF) return 'All months';
-  if (mm === 0 || mm === undefined || mm === null) return 'None';
+  if (mm === undefined || mm === null) return '';
+  if (mm === 0) return 'None';
   let s='';
   for(let i=0;i<12;i++) if(mm&(1<<i)) s+=M[i]+' ';
   return s.trim()||'None';
@@ -1367,22 +1352,17 @@ function nightBadge(sc){
   if(!sc.enabled)return'';
   const a=sc.startHour*3600+sc.startMinute*60+sc.startSecond;
   const b=sc.stopHour*3600+sc.stopMinute*60+sc.stopSecond;
-  const dayBits = (sc.days === undefined || sc.days === null) ? 0x7F : sc.days;
-  const monthDayBits = (sc.monthDays === undefined || sc.monthDays === null) ? 0x7FFFFFFF : (sc.monthDays & 0x7FFFFFFF);
-  const monthBits = (sc.monthMask === undefined || sc.monthMask === null) ? 0x0FFF : sc.monthMask;
-  const neverActive = (dayBits === 0) || (monthDayBits === 0) || (monthBits === 0);
-  const ds=dayMaskToStr(dayBits);
-  const ms=monthDayMaskToStr(monthDayBits);
-  const mm=monthMaskToStr(monthBits);
+  const ds=dayMaskToStr(sc.days === undefined ? 0x7F : sc.days);
+  const ms=monthDayMaskToStr(sc.monthDays === undefined ? 0x7FFFFFFF : sc.monthDays);
+  const mm=monthMaskToStr(sc.monthMask === undefined ? 0x0FFF : sc.monthMask);
   let parts=[];
   if(ds) parts.push(ds);
   if(ms && ms!=='All month days') parts.push('Days: '+ms);
   if(mm && mm!=='All months') parts.push('Months: '+mm);
   let info=parts.join(' | ');
-  const prefix = neverActive ? '&#x26A0; NEVER FIRES' : '';
-  if(a===b)return'<span class="night always">&#x25CF; Always ON'+(prefix?' — '+prefix:'')+' ('+info+')</span>';
-  if(a>b) return'<span class="night">&#x1F319; Overnight'+(prefix?' — '+prefix:'')+' ('+info+')</span>';
-  return'<span class="night">&#x1F319; '+info+(prefix?' — '+prefix:'')+'</span>';
+  if(a===b)return'<span class="night always">&#x25CF; Always ON ('+info+')</span>';
+  if(a>b) return'<span class="night">&#x1F319; Overnight ('+info+')</span>';
+  return'<span class="night">&#x1F319; '+info+'</span>';
 }
 
 function startEditName(relayIdx) {
@@ -1395,10 +1375,6 @@ function startEditName(relayIdx) {
   input.value = currentName;
   input.maxLength = 15;
   input.style.cssText = 'font-size:15px;font-weight:700;padding:2px 6px;border:1px solid #1565C0;border-radius:5px;width:120px;background:#fff;color:#1A1A2E;';
-  input.addEventListener('input', function() {
-    const v = this.value;
-    if (utf8ByteLength(v) > 15) this.value = truncateUtf8(v, 15);
-  });
   input.onblur = () => {
     if (editSuppressBlur) return;
     saveNameEdit(relayIdx, input.value);
@@ -1436,19 +1412,14 @@ function cancelEdit() {
   }
 }
 
+let nameEditSeq = {};
 function saveNameEdit(relayIdx, newName) {
   newName = newName.trim();
   if (newName.length === 0) {
     newName = 'Relay ' + (relayIdx + 1);
   }
-  newName = truncateUtf8(newName, 15);
-  if (newName.length === 0) {
-    newName = 'Relay ' + (relayIdx + 1);
-  }
   const nameSpan = document.getElementById('name_' + relayIdx);
   const oldName = relays[relayIdx].name || ('Relay ' + (relayIdx + 1));
-  const mySeq = (nameSeq[relayIdx] || 0) + 1;
-  nameSeq[relayIdx] = mySeq;
   relays[relayIdx].name = newName;
   if (nameSpan) {
     nameSpan.textContent = newName;
@@ -1459,6 +1430,8 @@ function saveNameEdit(relayIdx, newName) {
   editSuppressBlur = false;
   editingRelay = -1;
   editingInput = null;
+  const mySeq = (nameEditSeq[relayIdx] || 0) + 1;
+  nameEditSeq[relayIdx] = mySeq;
   fetchWithTimeout('/api/relay/name', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1466,7 +1439,7 @@ function saveNameEdit(relayIdx, newName) {
   })
   .then(r => r.json())
   .then(d => {
-    if (nameSeq[relayIdx] !== mySeq) return;
+    if (nameEditSeq[relayIdx] !== mySeq) return;
     if (d.success) {
       toast('Name saved!');
     } else {
@@ -1477,7 +1450,7 @@ function saveNameEdit(relayIdx, newName) {
     }
   })
   .catch(() => {
-    if (nameSeq[relayIdx] !== mySeq) return;
+    if (nameEditSeq[relayIdx] !== mySeq) return;
     relays[relayIdx].name = oldName;
     const span = document.getElementById('name_' + relayIdx);
     if (span) span.textContent = oldName;
@@ -1589,6 +1562,7 @@ function toggleMonth(ri,si,mIdx){
   const mask = 1<<mIdx;
   let cur = relays[ri].schedules[si].monthMask;
   if(cur === undefined || cur === null) cur = 0x0FFF;
+  cur = cur & 0x0FFF;
   cur ^= mask;
   relays[ri].schedules[si].monthMask = cur;
   const monEl = document.getElementById('mon_'+ri+'_'+si).children[mIdx];
@@ -1635,7 +1609,6 @@ function save(ri){
   if(busy) return;
   busy=true;
   const btn = document.querySelector(`button[onclick="save(${ri})"]`);
-  const originalText = btn ? btn.innerHTML : '';
   if(btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
   fetchWithTimeout('/api/relay/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,schedules:relays[ri].schedules})})
   .then(r=>r.json()).then(d=>{
@@ -1684,10 +1657,10 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="status" class="alert ai" style="display:none"></div>
 
 <div class="fg">
-<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+<label style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin-bottom:8px">
 <span style="font-size:14px;font-weight:600">WiFi Station Mode</span>
 <button id="staToggleBtn" class="btn" style="min-width:90px;padding:8px 16px;font-weight:700;transition:all 0.2s" onclick="toggleStation()"></button>
-</div>
+</label>
 <small>When disabled, ESP32 runs in AP-only mode (no internet/NTP). Relay schedules using internal RTC/DS3231 will still work. You can still access this UI via the AP.</small>
 </div>
 
@@ -1703,7 +1676,7 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 </div>
 <div class="netlist" id="netlist"></div>
 <div class="fg"><label>Password</label><input type="password" id="pw" placeholder="Enter password"></div>
-<button class="btn bsave" id="wifiSaveBtn" onclick="saveWiFi()">&#x1F4BE; Save &amp; Connect</button>
+<button class="btn bsave" onclick="saveWiFi()">&#x1F4BE; Save &amp; Connect</button>
 </div>
 </div>
 </main>
@@ -1731,339 +1704,268 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
 
-function tick(){
-  fetch('/api/time')
-    .then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-    .then(d=>{
-      document.getElementById('clk').textContent=d.time||'--:--:--';
-      const de=document.getElementById('date');
-      if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');
-      const w=document.querySelector('.wd'),t=document.querySelector('.td');
-      if(w)w.className='dot '+(d.wifi?'g':'r');
-      if(t){
-        let tc='y';
-        if(d.timeSource==='ntp')tc='g';
-        else if(d.timeSource==='browser')tc='b';
-        else if(d.timeSource==='rtc')tc='b';
-        t.className='dot '+tc;
-      }
-    })
-    .catch(()=>{});
-}
-setInterval(tick,1000);
-tick();
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status); return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+setInterval(tick,1000);tick();
 
-function updateStaButton(enabled){
-  const btn=document.getElementById('staToggleBtn');
-  if(!btn)return;
-  btn.dataset.enabled=enabled?'true':'false';
-  btn.dataset.loaded='true';
-  if(enabled){btn.textContent='✓ ON';btn.className='btn btn-sta-on';}
-  else{btn.textContent='✗ OFF';btn.className='btn btn-sta-off';}
-  btn.style.minWidth='90px';
-  btn.onclick=toggleStation;
+function updateStaButton(enabled) {
+    const btn = document.getElementById('staToggleBtn');
+    if(!btn) return;
+    btn.dataset.enabled = enabled ? 'true' : 'false';
+    if(enabled) {
+        btn.textContent = '✓ ON';
+        btn.className = 'btn btn-sta-on';
+    } else {
+        btn.textContent = '✗ OFF';
+        btn.className = 'btn btn-sta-off';
+    }
+    btn.style.minWidth = '90px';
 }
 
-function isStaEnabled(){
-  const btn=document.getElementById('staToggleBtn');
-  return !!(btn&&btn.dataset.enabled==='true');
+function isStaEnabled() {
+    const btn = document.getElementById('staToggleBtn');
+    return !!(btn && btn.dataset.enabled === 'true');
 }
 
-function isStaLoaded(){
-  const btn=document.getElementById('staToggleBtn');
-  return !!(btn&&btn.dataset.loaded==='true');
-}
-
-let statusLoadPending=false;
-let statusLoadRetries=0;
-const STATUS_MAX_RETRIES=5;
-
-function loadWiFiStatus(isManual){
-  if(statusLoadPending)return;
-  if(isManual)statusLoadRetries=0;
-  statusLoadPending=true;
-  fetch('/api/wifi')
-    .then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-    .then(d=>{
-      statusLoadPending=false;
-      statusLoadRetries=0;
-      const ssidEl=document.getElementById('ssid');
-      const serverSSID=d.ssid||'';
-      if(ssidEl&&document.activeElement!==ssidEl){
-        ssidEl.value=serverSSID;
-        window._lastSSID=serverSSID;
-      }
-      const staEnabled=d.sta_enabled!==undefined?d.sta_enabled:true;
-      updateStaButton(staEnabled);
-      const stationDiv=document.getElementById('stationConfig');
-      if(stationDiv){
-        stationDiv.style.opacity=staEnabled?'1':'0.5';
-        stationDiv.querySelectorAll('input, button').forEach(inp=>{inp.disabled=!staEnabled;});
-      }
-      const s=document.getElementById('status');
-      s.style.display='';
-      s.textContent='';
-      if(staEnabled&&d.connected){
-        const span1=document.createElement('span');
-        span1.style.fontWeight='700';
-        span1.textContent='✓ Connected';
-        s.appendChild(span1);
-        s.appendChild(document.createTextNode(' to: '));
-        const strong=document.createElement('strong');
-        strong.textContent=d.ssid||'';
-        s.appendChild(strong);
-        s.appendChild(document.createTextNode(' ('+(d.ip||'')+') '));
-        const bars=document.createElement('span');
-        bars.innerHTML=rssiBar(d.rssi||0);
-        s.appendChild(bars);
-        s.appendChild(document.createTextNode(' '+(d.rssi||0)+'dBm'));
-        s.className='alert ai';
-      }else if(staEnabled&&!d.connected){
-        const b1=document.createElement('span');
-        b1.style.fontWeight='700';
-        b1.textContent='⚠ Not Connected';
-        s.appendChild(b1);
-        s.appendChild(document.createElement('br'));
-        s.appendChild(document.createTextNode('Configure SSID/password above to connect to a WiFi network.'));
-        s.className='alert aw';
-      }else{
-        const b1=document.createElement('span');
-        b1.style.fontWeight='700';
-        b1.textContent='⛔ WiFi Station Disabled';
-        s.appendChild(b1);
-        s.appendChild(document.createElement('br'));
-        s.appendChild(document.createTextNode('ESP32 running in AP-only mode. Enable above to connect to WiFi networks for NTP time sync.'));
-        s.className='alert aw';
-      }
-    })
-    .catch(()=>{
-      statusLoadPending=false;
-      statusLoadRetries++;
-      if(statusLoadRetries<=STATUS_MAX_RETRIES){
-        setTimeout(()=>loadWiFiStatus(false),2000);
-      }else{
-        const btn=document.getElementById('staToggleBtn');
-        if(btn){
-          btn.dataset.loaded='true';
-          btn.textContent='? Retry';
-          btn.className='btn bwarn';
-          btn.onclick=()=>{loadWiFiStatus(true);};
+function loadWiFiStatus() {
+    fetch('/api/wifi').then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
+        const ssidEl = document.getElementById('ssid');
+        const active = document.activeElement;
+        const serverSSID = d.ssid || '';
+        if (ssidEl && active !== ssidEl && ssidEl.value !== serverSSID) {
+            ssidEl.value = serverSSID;
         }
-      }
+        window._lastSSID = serverSSID;
+        const staEnabled = d.sta_enabled !== undefined ? d.sta_enabled : true;
+        updateStaButton(staEnabled);
+        const stationDiv = document.getElementById('stationConfig');
+        if(stationDiv) {
+            stationDiv.style.opacity = staEnabled ? '1' : '0.5';
+            const inputs = stationDiv.querySelectorAll('input, button');
+            inputs.forEach(inp => inp.disabled = !staEnabled);
+        }
+        const s=document.getElementById('status');
+        s.style.display='';
+        s.textContent='';
+        if(staEnabled && d.connected){
+            const span1 = document.createElement('span');
+            span1.style.fontWeight='700';
+            span1.textContent='✓ Connected';
+            s.appendChild(span1);
+            s.appendChild(document.createTextNode(' to: '));
+            const strong = document.createElement('strong');
+            strong.textContent = d.ssid || '';
+            s.appendChild(strong);
+            s.appendChild(document.createTextNode(' ('+(d.ip||'')+') '));
+            const bars = document.createElement('span');
+            bars.innerHTML = rssiBar(d.rssi||0);
+            s.appendChild(bars);
+            s.appendChild(document.createTextNode(' '+(d.rssi||0)+'dBm'));
+            s.className='alert ai';
+        } else if(staEnabled && !d.connected) {
+            const b1 = document.createElement('span');
+            b1.style.fontWeight='700';
+            b1.textContent='⚠ Not Connected';
+            s.appendChild(b1);
+            s.appendChild(document.createElement('br'));
+            s.appendChild(document.createTextNode('Configure SSID/password above to connect to a WiFi network.'));
+            s.className='alert aw';
+        } else {
+            const b1 = document.createElement('span');
+            b1.style.fontWeight='700';
+            b1.textContent='⛔ WiFi Station Disabled';
+            s.appendChild(b1);
+            s.appendChild(document.createElement('br'));
+            s.appendChild(document.createTextNode('ESP32 running in AP-only mode. Enable above to connect to WiFi networks for NTP time sync.'));
+            s.className='alert aw';
+        }
+    }).catch(()=>{
     });
 }
 
 function rssiBar(rssi){
-  const b=rssi>=-50?4:rssi>=-60?3:rssi>=-70?2:1;
-  let s='<span class="bars">';
-  for(let i=1;i<=4;i++)s+='<span class="bar'+(i<=b?' on':'')+('" style="height:'+(i*3+2)+'px"></span>');
-  return s+'</span>';
+    const b=rssi>=-50?4:rssi>=-60?3:rssi>=-70?2:1;
+    let s='<span class="bars">';
+    for(let i=1;i<=4;i++)s+='<span class="bar'+(i<=b?' on':'')+('" style="height:'+(i*3+2)+'px"></span>');
+    return s+'</span>';
 }
 
-function toggleStation(){
-  const btn=document.getElementById('staToggleBtn');
-  if(!btn||btn.disabled)return;
-  if(!isStaLoaded()){toast('Still loading, please wait…',false);return;}
-  const wasEnabled=isStaEnabled();
-  const willEnable=!wasEnabled;
-  btn.disabled=true;
-  btn.textContent='...';
-  fetch('/api/wifi',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sta_enabled:willEnable})
-  })
-  .then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-  .then(d=>{
-    btn.disabled=false;
-    if(d.success){
-      updateStaButton(willEnable);
-      toast(willEnable?'WiFi Station ON':'WiFi Station OFF — NTP unavailable; use RTC/Browser sync',willEnable);
-      const stationDiv=document.getElementById('stationConfig');
-      if(stationDiv){
-        stationDiv.style.opacity=willEnable?'1':'0.5';
-        stationDiv.querySelectorAll('input, button').forEach(inp=>{inp.disabled=!willEnable;});
-      }
-      loadWiFiStatus(true);
-    }else{
-      toast('Failed to toggle WiFi station',false);
-      updateStaButton(wasEnabled);
-    }
-  })
-  .catch(()=>{
-    btn.disabled=false;
-    toast('Error toggling WiFi station',false);
-    updateStaButton(wasEnabled);
-    setTimeout(()=>loadWiFiStatus(true),1000);
-  });
-}
-
-let scanTimer=null,scanning=false,scanPollCount=0;
-const SCAN_POLL_MAX=20;
-
-function startScan(){
-  if(!isStaLoaded()){toast('Still loading, please wait…',false);return;}
-  if(!isStaEnabled()){toast('Please enable WiFi Station Mode first',false);return;}
-  if(scanning)return;
-  scanning=true;
-  scanPollCount=0;
-  document.getElementById('scanBtn').textContent='⏳ Scanning…';
-  document.getElementById('scanBtn').disabled=true;
-  const nl=document.getElementById('netlist');
-  nl.style.display='block';
-  nl.innerHTML='<div style="text-align:center;color:#90A4AE;padding:12px;font-size:13px">📡 Scanning for networks...</div>';
-  fetch('/api/wifi/scan',{method:'POST'})
-    .then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-    .then(()=>{scanTimer=setInterval(pollScan,2500);})
-    .catch(()=>{
-      endScan();
-      toast('Scan failed — enable WiFi Station',false);
-      const nl2=document.getElementById('netlist');
-      if(nl2){nl2.innerHTML='';nl2.style.display='none';}
+function toggleStation() {
+    const btn = document.getElementById('staToggleBtn');
+    if(!btn || btn.disabled) return;
+    const wasEnabled = isStaEnabled();
+    const willEnable = !wasEnabled;
+    btn.disabled = true;
+    btn.textContent = '...';
+    fetch('/api/wifi', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({sta_enabled: willEnable})
+    }).then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
+        btn.disabled = false;
+        if(d.success) {
+            updateStaButton(willEnable);
+            if(!willEnable) {
+                window._staDisabled = true;
+                if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+                if(scanning) endScan();
+                const nlReset = document.getElementById('netlist');
+                if(nlReset){ nlReset.innerHTML=''; nlReset.style.display='none'; }
+                toast('WiFi Station OFF \u2014 NTP unavailable; use RTC/Browser sync', false);
+            } else {
+                window._staDisabled = false;
+                toast('WiFi Station ON', true);
+            }
+            const stationDiv = document.getElementById('stationConfig');
+            if(stationDiv) {
+                stationDiv.style.opacity = willEnable ? '1' : '0.5';
+                const inputs = stationDiv.querySelectorAll('input, button');
+                inputs.forEach(inp => inp.disabled = !willEnable);
+            }
+            loadWiFiStatus();
+        } else {
+            toast('Failed to toggle WiFi station', false);
+            updateStaButton(wasEnabled);
+        }
+    }).catch(()=>{
+        btn.disabled = false;
+        toast('Error toggling WiFi station', false);
+        updateStaButton(wasEnabled);
+        setTimeout(loadWiFiStatus, 1000);
     });
 }
 
-function pollScan(){
-  if(!scanning)return;
-  scanPollCount++;
-  if(scanPollCount>SCAN_POLL_MAX){
-    if(scanTimer){clearInterval(scanTimer);scanTimer=null;}
-    endScan();
+let scanTimer=null,scanning=false;
+function startScan(){
+    if(!isStaEnabled()) {
+        toast('Please enable WiFi Station Mode first', false);
+        return;
+    }
+    window._staDisabled = false;
+    if(scanning)return;
+    scanning=true;
+    document.getElementById('scanBtn').textContent='\u23F3 Scanning\u2026';
+    document.getElementById('scanBtn').disabled=true;
     const nl=document.getElementById('netlist');
-    if(nl)nl.innerHTML='<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found (scan timed out).</div>';
-    toast('Scan timed out',false);
-    return;
-  }
-  fetch('/api/wifi/scan')
-    .then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
-    .then(d=>{
-      if(!scanning)return;
-      if(!d.scanning){
-        if(scanTimer){clearInterval(scanTimer);scanTimer=null;}
-        endScan();
-        const nets=Array.isArray(d.networks)?d.networks:[];
-        renderNets(nets);
-      }
+    nl.style.display='block';
+    nl.innerHTML='<div style="text-align:center;color:#90A4AE;padding:12px;font-size:13px">📡 Scanning for networks...</div>';
+    fetch('/api/wifi/scan',{method:'POST'})
+    .then(r => {
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    })
+    .then(()=>{ 
+        scanTimer=setInterval(pollScan,2500); 
     })
     .catch(()=>{
-      if(!scanning)return;
-      if(scanTimer){clearInterval(scanTimer);scanTimer=null;}
-      endScan();
-      toast('Scan poll failed',false);
+        endScan();
+        toast('Scan failed \u2014 enable WiFi Station', false);
+        const nl2=document.getElementById('netlist');
+        if(nl2){ nl2.innerHTML=''; nl2.style.display='none'; }
     });
 }
-
+function pollScan(){
+    fetch('/api/wifi/scan').then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
+        if(window._staDisabled){ return; }
+        if(!d.scanning){
+            if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+            endScan();
+            const nets = Array.isArray(d.networks) ? d.networks : [];
+            renderNets(nets);
+        }
+    }).catch(()=>{
+        if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+        endScan();
+        toast('Scan poll failed', false);
+    });
+}
 function endScan(){
-  scanning=false;
-  const btn=document.getElementById('scanBtn');
-  if(btn){btn.textContent='📶 Scan';btn.disabled=!isStaEnabled();}
+    scanning=false;
+    document.getElementById('scanBtn').textContent='\uD83D\uDCF6 Scan';
+    document.getElementById('scanBtn').disabled=false;
 }
-
 function renderNets(nets){
-  const nl=document.getElementById('netlist');
-  if(!Array.isArray(nets)||nets.length===0){
-    nl.innerHTML='<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found. Make sure WiFi is enabled.</div>';
-    return;
-  }
-  const frag=document.createDocumentFragment();
-  const hdr=document.createElement('div');
-  hdr.className='net-hdr';
-  hdr.textContent='Available Networks';
-  frag.appendChild(hdr);
-  const sorted=nets.slice().sort((a,b)=>(b.rssi||0)-(a.rssi||0));
-  sorted.forEach(n=>{
-    const d=document.createElement('div');
-    d.className='netitem';
-    const ns=document.createElement('span');
-    ns.className='ns';
-    ns.textContent=n.ssid;
-    const nr=document.createElement('span');
-    nr.className='nr';
-    nr.textContent=(n.rssi||0)+'dBm';
-    const bar=document.createElement('span');
-    bar.innerHTML=rssiBar(n.rssi||0);
-    const lock=document.createElement('span');
-    lock.style.fontSize='13px';
-    lock.textContent=n.enc?'🔒':'';
-    d.appendChild(ns);
-    d.appendChild(nr);
-    d.appendChild(bar);
-    d.appendChild(lock);
-    d.addEventListener('click',()=>{
-      document.getElementById('ssid').value=n.ssid;
-      document.getElementById('pw').focus();
+    const nl=document.getElementById('netlist');
+    if(!Array.isArray(nets) || nets.length===0){
+        nl.innerHTML='<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found. Make sure WiFi is enabled.</div>';
+        return;
+    }
+    const frag=document.createDocumentFragment();
+    const hdr=document.createElement('div');hdr.className='net-hdr';hdr.textContent='Available Networks';frag.appendChild(hdr);
+    const sorted = nets.slice().sort((a,b)=>(b.rssi||0)-(a.rssi||0));
+    sorted.forEach(n=>{
+        const d=document.createElement('div');d.className='netitem';
+        const ns=document.createElement('span');ns.className='ns';ns.textContent=n.ssid;
+        const nr=document.createElement('span');nr.className='nr';nr.textContent=(n.rssi||0)+'dBm';
+        const bar=document.createElement('span');bar.innerHTML=rssiBar(n.rssi||0);
+        const lock=document.createElement('span');lock.style.fontSize='13px';lock.textContent=n.enc?'\uD83D\uDD12':'';
+        d.appendChild(ns);d.appendChild(nr);d.appendChild(bar);d.appendChild(lock);
+        d.addEventListener('click',()=>{
+            const ssidEl=document.getElementById('ssid');
+            const pwEl=document.getElementById('pw');
+            if(ssidEl && ssidEl.value !== n.ssid && pwEl) pwEl.value='';
+            if(ssidEl) ssidEl.value=n.ssid;
+            if(pwEl) pwEl.focus();
+        });
+        frag.appendChild(d);
     });
-    frag.appendChild(d);
-  });
-  nl.innerHTML='';
-  nl.appendChild(frag);
+    nl.innerHTML='';nl.appendChild(frag);
 }
-
 function saveWiFi(){
-  if(!isStaLoaded()){toast('Still loading, please wait…',false);return;}
-  if(!isStaEnabled()){toast('Enable WiFi Station Mode first to save credentials',false);return;}
-  const ssidEl=document.getElementById('ssid');
-  const ssid=(ssidEl.value||'').trim();
-  if(!ssid){toast('SSID required',false);return;}
-  let ssidBytes;
-  try{ssidBytes=new TextEncoder().encode(ssid).length;}
-  catch(e){ssidBytes=ssid.length;}
-  if(ssidBytes>=32){toast('SSID must be under 32 bytes (UTF-8)',false);return;}
-  const pwEl=document.getElementById('pw');
-  const pwVal=pwEl.value||'';
-  if(pwVal.length>0){
-    let pwBytes;
-    try{pwBytes=new TextEncoder().encode(pwVal).length;}
-    catch(e){pwBytes=pwVal.length;}
-    if(pwBytes>63){toast('Password must be 63 bytes or less',false);return;}
-  }
-  const ssidChanged=(ssid!==(window._lastSSID||''));
-  if(ssidChanged&&pwVal.length===0){
-    if(!confirm('You changed the SSID but left the password blank.\nThis will clear the stored password.\n\nContinue?')){
-      toast('Save cancelled',false);
-      return;
+    if(!isStaEnabled()) {
+        toast('Enable WiFi Station Mode first to save credentials', false);
+        return;
     }
-  }
-  const btn=document.getElementById('wifiSaveBtn');
-  if(!btn||btn.disabled)return;
-  btn.disabled=true;
-  btn.textContent='Saving...';
-  const body={ssid:ssid};
-  if(pwVal.length>0)body.password=pwVal;
-  fetch('/api/wifi',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(body)
-  })
-  .then(r=>{
-    if(!r.ok)return r.json().then(e=>Promise.reject(e));
-    return r.json();
-  })
-  .then(d=>{
-    btn.disabled=false;
-    btn.innerHTML='&#x1F4BE; Save &amp; Connect';
-    if(d.success){
-      window._lastSSID=ssid;
-      const nl=document.getElementById('netlist');
-      if(nl){nl.innerHTML='';nl.style.display='none';}
-      if(ssidChanged){
-        toast('Credentials saved! Reconnecting...');
-        setTimeout(()=>window.location.href='/',3000);
-      }else{
-        toast('Settings saved.');
-      }
-    }else{
-      toast('Failed: '+(d.error||'Unknown'),false);
+    const ssidEl = document.getElementById('ssid');
+    const ssid=ssidEl.value.trim();
+    if(!ssid){toast('SSID required',false);return;}
+    try {
+        if(new TextEncoder().encode(ssid).length > 31){toast('SSID must be 31 bytes or less',false);return;}
+    } catch(e) {
+        if(ssid.length > 31){toast('SSID must be 31 characters or less',false);return;}
     }
-  })
-  .catch(e=>{
-    btn.disabled=false;
-    btn.innerHTML='&#x1F4BE; Save &amp; Connect';
-    toast('Error: '+((e&&e.error)||'request failed'),false);
-  });
+    const btn = document.querySelector('.bsave');
+    if(!btn || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    const body = {ssid: ssid};
+    const pwVal = document.getElementById('pw').value;
+    if (pwVal.length > 0) body.password = pwVal;
+    const lastKnownSSID = (typeof window._lastSSID === 'string') ? window._lastSSID : '';
+    const ssidChanged = (ssid !== lastKnownSSID);
+    fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>{
+        if(!r.ok) return r.json().then(e=>Promise.reject(e));
+        return r.json();
+    }).then(d=>{
+        btn.disabled = false;
+        btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
+        if(d.success){
+            if(ssidChanged){
+                toast('Credentials saved! Reconnecting...');
+                setTimeout(()=>window.location.href='/',3000);
+            } else {
+                toast('Settings saved.');
+            }
+        } else {
+            toast('Failed: '+(d.error||'Unknown'), false);
+        }
+    }).catch((e)=>{
+        btn.disabled = false;
+        btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
+        toast('Error: '+((e && e.error) || 'request failed'), false);
+    });
 }
-
-loadWiFiStatus(false);
+loadWiFiStatus();
+setInterval(loadWiFiStatus, 5000);
 </script></body></html>)raw";
 
 // =============================================================================
@@ -2119,7 +2021,8 @@ const char ntp_html[] PROGMEM = R"raw(<!DOCTYPE html>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
 let lastNtpSyncAge = -1;
 function fmtOff(s){const h=Math.floor(Math.abs(s)/3600);const m=Math.floor((Math.abs(s)%3600)/60);return (s<0?'-':'+')+h+(m?':'+String(m).padStart(2,'0'):'');}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}if(d.ntpSyncAge!==undefined&&d.ntpSyncAge!==4294967295)lastNtpSyncAge=d.ntpSyncAge;updateTimeStatus(d);}).catch(()=>{});}
+function tick(){
+  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}if(typeof d.ntpSyncAge === 'number' && d.ntpSyncAge !== 4294967295 && d.ntpSyncAge >= 0)lastNtpSyncAge=d.ntpSyncAge;updateTimeStatus(d);}).catch(()=>{});}
 function updateTimeStatus(d){
   const s=document.getElementById('timeStatus');
   s.style.display='block';
@@ -2141,10 +2044,11 @@ function updateTimeStatus(d){
   if(d.rtcPresent){
     rtcInfo = '<br><small>✅ DS3231 RTC detected on GPIO21/22';
     if(d.rtcSynced){
-      if(d.rtcSyncAge === 4294967295 || d.rtcSyncAge < 0){
+      const age = (typeof d.rtcSyncAge === 'number') ? d.rtcSyncAge : -1;
+      if(age < 0 || age === 4294967295){
         rtcInfo += ' | Last sync: Never';
       } else {
-        rtcInfo += ' | Last sync: ' + d.rtcSyncAge + 's ago';
+        rtcInfo += ' | Last sync: ' + age + 's ago';
       }
     }
     rtcInfo += '</small>';
@@ -2153,7 +2057,8 @@ function updateTimeStatus(d){
   }
   let dstInfo = '';
   if(d.tzName){
-    dstInfo = '<br><small>🌍 Timezone: <strong>' + d.tzName + '</strong>';
+    const tzSafe = String(d.tzName).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    dstInfo = '<br><small>🌍 Timezone: <strong>' + tzSafe + '</strong>';
     if(d.dstActive){
       dstInfo += ' — <span style="color:#E65100;font-weight:700">DST ACTIVE</span>';
     } else {
@@ -2175,7 +2080,7 @@ function loadTZ(){
     tzList.forEach(z=>{
       const o = document.createElement('option');
       o.value = z.name;
-      o.textContent = z.name + ' (' + (z.offset === 0 ? 'UTC' : 'UTC' + fmtOff(z.offset)) + (z.dst ? ' +DST' : '') + ')';
+      o.textContent = z.name + ' (UTC' + fmtOff(z.offset) + (z.dst ? ' +DST' : '') + ')';
       sel.appendChild(o);
     });
     const manualOpt = document.createElement('option');
@@ -2183,61 +2088,43 @@ function loadTZ(){
     manualOpt.textContent = 'Manual Offset (custom GMT)';
     sel.appendChild(manualOpt);
     fetch('/api/ntp').then(r=>r.json()).then(cfg=>{
-      window._lastNtpCfg = cfg;
-      window._ntpLoadFailed = false;
-      const _sb = document.querySelector('.bsave');
-      if(_sb){ _sb.disabled = false; _sb.style.opacity = ''; _sb.style.cursor = ''; }
-      let unknownTz = false;
       if (cfg.tzName && cfg.tzName !== 'Manual' && !tzList.some(z => z.name === cfg.tzName)) {
         const o = document.createElement('option');
         o.value = cfg.tzName;
-        o.textContent = '\u26A0 ' + cfg.tzName + ' (unknown \u2014 will use Manual offset)';
-        o.disabled = true;
+        o.textContent = cfg.tzName + ' (' + fmtOff(cfg.gmtOffset || 0) + ')';
         sel.appendChild(o);
-        unknownTz = true;
       }
-      if (unknownTz) {
-        sel.value = 'Manual';
-      } else {
-        sel.value = cfg.tzName || 'UTC';
-      }
-      document.getElementById('gmt').value = cfg.gmtOffset;
-      document.getElementById('srv').value = cfg.ntpServer || 'time.google.com';
-      document.getElementById('shi').value = cfg.syncHours || 1;
+      sel.value = cfg.tzName || 'UTC';
+      const gmtEl = document.getElementById('gmt');
+      if(gmtEl && typeof cfg.gmtOffset === 'number') gmtEl.value = cfg.gmtOffset;
+      const srvEl = document.getElementById('srv');
+      if(srvEl) srvEl.value = (typeof cfg.ntpServer === 'string' && cfg.ntpServer) ? cfg.ntpServer : 'time.google.com';
+      const shiEl = document.getElementById('shi');
+      if(shiEl) shiEl.value = (typeof cfg.syncHours === 'number' && cfg.syncHours >= 1 && cfg.syncHours <= 24) ? cfg.syncHours : 1;
       updateTzInfo(cfg);
       toggleGmtField();
-    }).catch(()=>{
-      window._ntpLoadFailed = true;
-      const info = document.getElementById('tzInfo');
-      if(info) info.textContent = 'Could not load current NTP settings. Reload the page to try again.';
-      const saveBtn = document.querySelector('.bsave');
-      if(saveBtn){ saveBtn.disabled = true; saveBtn.style.opacity = '0.5'; saveBtn.style.cursor = 'not-allowed'; }
-    });
+    }).catch(()=>{});
   }).catch(()=>{
-    window._ntpLoadFailed = true;
-    const sel = document.getElementById('tz');
-    sel.innerHTML = '<option value="UTC">UTC</option><option value="Manual">Manual Offset (custom GMT)</option>';
-    sel.value = 'Manual';
-    const gmtEl = document.getElementById('gmt');
-    if(gmtEl){ gmtEl.readOnly = false; gmtEl.style.background = '#fff'; gmtEl.style.color = '#1A1A2E'; }
-    const info = document.getElementById('tzInfo');
-    if(info) info.textContent = 'Could not load timezone list. Enter GMT offset manually.';
-    const saveBtn = document.querySelector('.bsave');
-    if(saveBtn){ saveBtn.disabled = true; saveBtn.style.opacity = '0.5'; saveBtn.style.cursor = 'not-allowed'; }
+    document.getElementById('tz').innerHTML = '<option value="UTC">UTC</option>';
   });
   const selEl = document.getElementById('tz');
-  if(selEl) selEl.addEventListener('change', toggleGmtField);
+  if(selEl && !selEl._hasTzListener) {
+    selEl.addEventListener('change', toggleGmtField);
+    selEl._hasTzListener = true;
+  }
 }
 function updateTzInfo(cfg){
   const info = document.getElementById('tzInfo');
   if(cfg.tzAutoDst){
+    const dstH = (typeof cfg.dstOffset === 'number') ? (cfg.dstOffset/3600) : 0;
     info.textContent = 'Auto-DST enabled. Current DST: ' +
-      (cfg.dstActive ? 'ACTIVE (+' + (cfg.dstOffset/3600) + 'h)' : 'inactive') +
+      (cfg.dstActive ? 'ACTIVE (+' + dstH + 'h)' : 'inactive') +
       '. Transitions detected within 5 seconds.';
   } else {
     info.textContent = 'Manual offset mode. DST not applied automatically.';
   }
-  document.getElementById('gmt').value = cfg.gmtOffset;
+  const gmtEl = document.getElementById('gmt');
+  if(gmtEl && typeof cfg.gmtOffset === 'number') gmtEl.value = cfg.gmtOffset;
 }
 
 function toggleGmtField(){
@@ -2250,23 +2137,18 @@ function toggleGmtField(){
   gmtEl.readOnly = !isManual;
   gmtEl.style.background = isManual ? '#fff' : '#ECEFF1';
   gmtEl.style.color = isManual ? '#1A1A2E' : '#607D8B';
-  if(info){
-    if(isManual){
-      info.textContent = 'Manual offset mode. Enter GMT offset in seconds (e.g. 20700 = UTC+5:45). DST not applied automatically.';
-    } else if(window._lastNtpCfg){
-      updateTzInfo(window._lastNtpCfg);
-    }
+  if(isManual && info){
+    info.textContent = 'Manual offset mode. Enter GMT offset in seconds (e.g. 20700 = UTC+5:45). DST not applied automatically.';
   }
 }
 function save(){
-  if(window._ntpLoadFailed){ toast('Reload the page before saving \u2014 settings did not load', false); return; }
   const h=parseInt(document.getElementById('shi').value);
   if(isNaN(h)||h<1||h>24){toast('Sync interval must be 1\u201324 h',false);return;}
-  const ntpSrv = (document.getElementById('srv').value||'').trim();
-  if(ntpSrv.length===0){toast('NTP server cannot be empty',false);return;}
-  if(ntpSrv.length>=48){toast('NTP server must be under 48 characters',false);return;}
+  const srvVal = document.getElementById('srv').value.trim();
+  if(srvVal.length === 0){toast('NTP server cannot be empty', false); return;}
+  if(srvVal.length >= 48){toast('NTP server must be 47 characters or less', false); return;}
   const body = {
-    ntpServer: ntpSrv,
+    ntpServer: srvVal,
     syncHours: h
   };
   const tzVal = document.getElementById('tz').value;
@@ -2302,20 +2184,15 @@ function sync(){
       toast('Sync failed \u2014 ' + (d.error || 'check WiFi/NTP'), false);
       return;
     }
-    if(d.message && d.message.indexOf('already in progress') !== -1){
-      toast('NTP sync already in progress\u2026');
-    } else {
-      toast('NTP sync initiated\u2026');
-    }
+    toast('NTP sync initiated\u2026');
     let attempts = 0;
-    let sawBackendReset = false;
     const poll = setInterval(()=>{
       attempts++;
       fetch('/api/time').then(r=>r.json()).then(t=>{
-        const age = (t.ntpSyncAge === undefined || t.ntpSyncAge === 4294967295) ? -1 : t.ntpSyncAge;
-        if(age === -1) sawBackendReset = true;
+        const age = (typeof t.ntpSyncAge !== 'number' || t.ntpSyncAge === 4294967295 || t.ntpSyncAge < 0) ? -1 : t.ntpSyncAge;
+        const preAgeSafe = (typeof preAge === 'number' && preAge >= 0) ? preAge : -1;
         const isFresh = (t.timeSource === 'ntp') && (age >= 0) && (age < 15);
-        const isNewer = (preAge < 0) || sawBackendReset;
+        const isNewer = (preAgeSafe < 0) || (age >= 0 && age < preAgeSafe);
         if(isFresh && isNewer){
           clearInterval(poll);
           b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
@@ -2350,9 +2227,12 @@ function syncFromBrowser(){
     if (d.success) {
       const clkEl = document.getElementById('clk');
       const dateEl = document.getElementById('date');
-      if(clkEl) clkEl.textContent = d.local_time || '--:--:--';
-      if(dateEl) dateEl.textContent = (d.weekday ? d.weekday + ' ' : '') + (d.local_date || '--/--/----');
-      let msg = 'Time synced from browser! Local time: ' + (d.local_time || '') + (d.local_date ? ' ' + d.local_date : '');
+      const safeTime = (typeof d.local_time === 'string' && d.local_time) ? d.local_time : '--:--:--';
+      const safeDate = (typeof d.local_date === 'string' && d.local_date) ? d.local_date : '--/--/----';
+      const safeWday = (typeof d.weekday === 'string' && d.weekday) ? d.weekday : '';
+      if(clkEl) clkEl.textContent = safeTime;
+      if(dateEl) dateEl.textContent = (safeWday ? safeWday + ' ' : '') + safeDate;
+      let msg = 'Time synced from browser! Local time: ' + safeTime + (safeDate !== '--/--/----' ? ' ' + safeDate : '');
       if(d.rtc_synced) msg += ' | DS3231 updated';
       toast(msg);
       tick();
@@ -2390,6 +2270,7 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <main>
 <p class="ptitle">Access Point Settings</p>
 <div class="card fcrd">
+<form onsubmit="return false" autocomplete="off">
 <div class="alert aw">&#x26A0;&#xFE0F; Changing SSID, Password, Channel or Visibility will restart the AP and disconnect all clients. Reconnect to the new SSID afterward.</div>
 <div class="fg"><label>AP SSID</label><input type="text" id="ssid" maxlength="31" required></div>
 <div class="fg"><label>AP Password</label><input type="password" id="pw" minlength="8" maxlength="31" placeholder="Leave blank to keep current password"></div>
@@ -2412,7 +2293,8 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <option value="1">Hidden (do not broadcast)</option>
 </select>
 </div>
-<button class="btn bsave" onclick="save()" id="apSaveBtn">&#x1F4BE; Save Settings</button>
+<button type="button" class="btn bsave" onclick="save()" id="apSaveBtn">&#x1F4BE; Save Settings</button>
+</form>
 </div>
 </main>
 <div id="toast"></div>
@@ -2420,9 +2302,9 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
 function escapeHtml(text){const d=document.createElement('div');d.textContent=String(text==null?'':text);return d.innerHTML;}
 let savingAP = false;
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
-fetch('/api/ap').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+fetch('/api/ap').then(r=>r.json()).then(d=>{
   document.getElementById('ssid').value=d.ap_ssid||'';
   document.getElementById('ch').value=d.ap_channel||6;
   document.getElementById('hidden').value=d.ap_hidden?'1':'0';
@@ -2430,11 +2312,7 @@ fetch('/api/ap').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.js
   const clearEl = document.getElementById('clearPw');
   if(pwEl) pwEl.addEventListener('input', function(){ if(this.value.length > 0 && clearEl) clearEl.checked = false; });
   if(clearEl) clearEl.addEventListener('change', function(){ if(this.checked && pwEl) pwEl.value = ''; });
-}).catch(()=>{
-  toast('Failed to load AP settings — reload the page', false);
-  const btn = document.getElementById('apSaveBtn');
-  if(btn){ btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed'; }
-});
+}).catch(()=>{});
 function save(){
   if(savingAP) return;
   const btn = document.getElementById('apSaveBtn') || document.querySelector('.bsave');
@@ -2460,12 +2338,6 @@ function save(){
     toast('Password must be 31 characters or less', false);
     return;
   }
-  try {
-    if(new TextEncoder().encode(pw).length > 31){
-      toast('Password must be 31 bytes or less (multi-byte characters use more bytes)', false);
-      return;
-    }
-  } catch(e) {}
   if(shouldClear && pw.length > 0){
     toast('Uncheck "Remove password" or clear the password field', false);
     return;
@@ -2486,8 +2358,17 @@ function save(){
   savingAP = true;
   if(btn){ btn.disabled = true; btn.textContent = 'Saving...'; }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  let controller;
+  let timeoutId;
+  try {
+    controller = new AbortController();
+    timeoutId = setTimeout(() => controller.abort(), 15000);
+  } catch(err) {
+    savingAP = false;
+    if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+    toast('Error: browser does not support required features', false);
+    return;
+  }
 
   fetch('/api/ap', {
     method: 'POST',
@@ -2496,7 +2377,7 @@ function save(){
     signal: controller.signal
   })
   .then(r => {
-    clearTimeout(timeoutId);
+    if(timeoutId !== undefined) clearTimeout(timeoutId);
     if(!r.ok){
       return r.json().then(e => Promise.reject(e)).catch(() => Promise.reject({error:'HTTP '+r.status}));
     }
@@ -2504,6 +2385,11 @@ function save(){
   })
   .then(d => {
     savingAP = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d)){
+      toast('Error: invalid response from device', false);
+      if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+      return;
+    }
     if(d.success){
       if(d.restarted){
         toast('AP restarted \u2014 reconnect to new network', false);
@@ -2526,21 +2412,8 @@ function save(){
     }
   })
   .catch((e) => {
-    clearTimeout(timeoutId);
+    if(timeoutId !== undefined) clearTimeout(timeoutId);
     savingAP = false;
-    const isAbort = (e && (e.name === 'AbortError' || e.code === 20));
-    if(isAbort){
-      document.body.innerHTML = '<div style="text-align:center;padding:60px 20px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#EEF2F7;min-height:100vh;box-sizing:border-box">'
-        + '<div style="background:#fff;max-width:420px;margin:0 auto;border-radius:12px;padding:32px 24px;box-shadow:0 4px 20px rgba(0,0,0,.1)">'
-        + '<h2 style="color:#E65100;margin:0 0 16px;font-size:20px">\u23F1 Request Timed Out</h2>'
-        + '<p style="font-size:15px;color:#37474F;margin:0 0 20px">The AP may have restarted with your new settings.</p>'
-        + '<p style="font-size:14px;color:#607D8B;margin:0 0 8px">Try reconnecting to:</p>'
-        + '<p style="font-size:18px;font-weight:700;color:#1565C0;margin:0 0 20px;word-break:break-word">' + escapeHtml(ssid) + '</p>'
-        + '<p style="font-size:14px;color:#607D8B;margin:0 0 8px">Then open:</p>'
-        + '<p style="font-size:16px;font-weight:700;margin:0"><a href="http://192.168.4.1/" style="color:#1565C0;text-decoration:none">192.168.4.1</a></p>'
-        + '</div></div>';
-      return;
-    }
     toast('Error: ' + ((e && e.error) || 'request failed'), false);
     if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
   });
@@ -2609,7 +2482,7 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
 // change gpio
 const DEFAULT_PINS = [23,32,33,25,26,27,14,13,1,3,19,18,5,4,2,15];
@@ -2764,9 +2637,6 @@ function resetDefaults() {
 loadGPIO();
 </script></body></html>)raw";
 
-// =============================================================================
-//  SYSTEM PAGE
-// =============================================================================
 const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>System</title>
@@ -2822,9 +2692,38 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+
+function tick(){
+  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+    if(!d || typeof d !== 'object') return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = (typeof d.time === 'string' && d.time) ? d.time : '--:--:--';
+    const de = document.getElementById('date');
+    if(de){
+      const wk = (typeof d.weekday === 'string' && d.weekday) ? d.weekday + ' ' : '';
+      const dt = (typeof d.date === 'string' && d.date) ? d.date : '--/--/----';
+      de.textContent = wk + dt;
+    }
+    const w = document.querySelector('.wd');
+    const t = document.querySelector('.td');
+    if(w) w.className = 'dot ' + (d.wifi ? 'g' : 'r');
+    if(t){
+      let tc = 'y';
+      if(d.timeSource === 'ntp') tc = 'g';
+      else if(d.timeSource === 'browser') tc = 'y';
+      else if(d.timeSource === 'rtc') tc = 'g';
+      else if(d.timeSource === 'ds3231') tc = 'g';
+      else if(d.timeSource === 'internal rtc') tc = 'g';
+      else tc = 'y';
+      t.className = 'dot ' + tc;
+    }
+  }).catch(()=>{});
+}
 setInterval(tick,1000);tick();
+
 function fmtUp(s){
+  if(typeof s !== 'number' || !isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -2834,82 +2733,212 @@ function fmtUp(s){
   if (m > 0) return m + 'm ' + ss + 's';
   return ss + 's';
 }
-function fmtAge(s){if(s===4294967295||s<0)return'Never';if(s<60)return'Just now';if(s<3600)return Math.floor(s/60)+' min ago';const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m ago';}
-function rssiDesc(r){if(!r)return'\u2014';return r+'dBm ('+( r>=-50?'Excellent':r>=-60?'Good':r>=-70?'Fair':'Weak')+')';}
+
+function fmtAge(s){
+  if(typeof s !== 'number' || !isFinite(s) || s < 0 || s === 4294967295) return 'Never';
+  s = Math.floor(s);
+  if(s < 60) return 'Just now';
+  if(s < 3600) return Math.floor(s/60) + ' min ago';
+  const h = Math.floor(s/3600);
+  return h + 'h ' + Math.floor((s%3600)/60) + 'm ago';
+}
+
+function rssiDesc(r){
+  if(typeof r !== 'number' || !isFinite(r) || r === 0) return '\u2014';
+  return r + 'dBm (' + (r>=-50?'Excellent':r>=-60?'Good':r>=-70?'Fair':'Weak') + ')';
+}
+
+function formatGmtOffset(sec){
+  if(typeof sec !== 'number' || !isFinite(sec)) sec = 0;
+  const sign = sec >= 0 ? '+' : '-';
+  const absG = Math.abs(sec);
+  const gh = Math.floor(absG / 3600);
+  const gmn = Math.floor((absG % 3600) / 60);
+  const gss = absG % 60;
+  let s = 'UTC' + sign + gh;
+  if(gmn !== 0 || gss !== 0){
+    s += ':' + String(gmn).padStart(2, '0');
+    if(gss !== 0) s += ':' + String(gss).padStart(2, '0');
+  }
+  return s;
+}
+
+function safeAge(v){
+  return (typeof v === 'number' && isFinite(v) && v >= 0 && v !== 4294967295) ? Math.floor(v) : -1;
+}
+
 function loadSys(){
-  fetch('/api/system').then(r=>r.json()).then(d=>{
-    if(!d || Object.keys(d).length === 0) return;
-    document.getElementById('sip').textContent=d.wifiConnected?d.ip:'(not connected)';
-    document.getElementById('sap').textContent=d.ap_ip;
-    document.getElementById('shp').textContent=(d.freeHeap/1024).toFixed(1)+' KB';
-    document.getElementById('sup').textContent=fmtUp(d.uptime);
-    document.getElementById('srs').textContent=d.wifiConnected?rssiDesc(d.rssi):'\u2014';
-    const tsrc=d.timeSource||'None';
-    let tsrcStyle='';
-    if(tsrc==='NTP')tsrcStyle='color:#2E7D32';
-    else if(tsrc==='Browser')tsrcStyle='color:#1565C0';
-    else if(tsrc==='RTC')tsrcStyle='color:#7B1FA2';
-    else tsrcStyle='color:#C62828';
-    document.getElementById('stsrc').style.cssText='font-size:13px;font-weight:700;'+tsrcStyle;
-    document.getElementById('stsrc').textContent=tsrc;
-    document.getElementById('stz').textContent=d.tzName||'\u2014';
-    const dstEl = document.getElementById('sdst');
-    if(d.dstActive){
-      dstEl.textContent = '🌞 ACTIVE (+' + Math.round((d.dstOffset||0)/3600*10)/10 + 'h)';
-      dstEl.style.color = '#E65100';
-    } else {
-      dstEl.textContent = '❄️ Standard';
-      dstEl.style.color = '#1565C0';
+  fetch('/api/system').then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    if(!d || typeof d !== 'object' || Array.isArray(d) || Object.keys(d).length === 0) return;
+
+    const sipEl = document.getElementById('sip');
+    if(sipEl) sipEl.textContent = (d.wifiConnected && typeof d.ip === 'string' && d.ip) ? d.ip : '(not connected)';
+
+    const sapEl = document.getElementById('sap');
+    if(sapEl) sapEl.textContent = (typeof d.ap_ip === 'string' && d.ap_ip) ? d.ap_ip : '\u2014';
+
+    const shpEl = document.getElementById('shp');
+    if(shpEl){
+      const fh = (typeof d.freeHeap === 'number' && isFinite(d.freeHeap)) ? d.freeHeap : 0;
+      shpEl.textContent = (fh/1024).toFixed(1) + ' KB';
     }
-    document.getElementById('sutc').textContent=(d.utcEpoch && d.utcEpoch !== '0') ? d.utcEpoch : '\u2014';
-    document.getElementById('snt').textContent=d.ntpSyncAge>=0?fmtAge(d.ntpSyncAge):'Never';
-    document.getElementById('sbs').textContent=d.browserSyncAge>=0?fmtAge(d.browserSyncAge):'Never';
-    document.getElementById('sns').textContent=d.ntpServer||'\u2014';
-    document.getElementById('sch').textContent=d.chipModel||'ESP32';
-    document.getElementById('smdns').textContent=d.mdnsStarted ? d.mdnsHostname+'.local' : 'Not running';
-    document.getElementById('src').textContent=d.relayCount+' / '+d.maxRelays;
-    document.getElementById('sgmt').textContent=(d.gmtOffset/3600).toFixed(1)+'h (UTC'+(d.gmtOffset>=0?'+':'')+(d.gmtOffset/3600).toFixed(1)+')';
-    document.getElementById('sdrift').textContent=d.driftComp ? d.driftComp.toFixed(4) : '1.0000';
-    let modeText = '';
-    if(d.globalActiveMode === 1) modeText = '🌍 Global LOW';
-    else if(d.globalActiveMode === 2) modeText = '🌍 Global HIGH';
-    else modeText = '🔧 Per-Relay';
-    document.getElementById('sactmode').textContent = modeText;
-    document.getElementById('srtc').textContent = d.rtcPresent ? '✅ Present' : '❌ Not detected';
-    if(d.rtcPresent) document.getElementById('srtc').style.color='#2E7D32';
-    else document.getElementById('srtc').style.color='#C62828';
-    document.getElementById('srtcsync').textContent = d.rtcSyncAge >= 0 ? fmtAge(d.rtcSyncAge) : 'Never';
+
+    const supEl = document.getElementById('sup');
+    if(supEl) supEl.textContent = fmtUp(d.uptime);
+
+    const srsEl = document.getElementById('srs');
+    if(srsEl) srsEl.textContent = d.wifiConnected ? rssiDesc(d.rssi) : '\u2014';
+
+    const tsrcEl = document.getElementById('stsrc');
+    if(tsrcEl){
+      const tsrc = (typeof d.timeSource === 'string' && d.timeSource) ? d.timeSource : 'None';
+      let tsrcStyle = 'color:#C62828';
+      if(tsrc === 'NTP') tsrcStyle = 'color:#2E7D32';
+      else if(tsrc === 'Browser') tsrcStyle = 'color:#1565C0';
+      else if(tsrc === 'DS3231') tsrcStyle = 'color:#7B1FA2';
+      else if(tsrc === 'Internal RTC') tsrcStyle = 'color:#7B1FA2';
+      tsrcEl.style.cssText = 'font-size:13px;font-weight:700;' + tsrcStyle;
+      tsrcEl.textContent = tsrc;
+    }
+
+    const stzEl = document.getElementById('stz');
+    if(stzEl) stzEl.textContent = (typeof d.tzName === 'string' && d.tzName) ? d.tzName : '\u2014';
+
+    const dstEl = document.getElementById('sdst');
+    if(dstEl){
+      const dstSec = (typeof d.dstOffset === 'number' && isFinite(d.dstOffset)) ? d.dstOffset : 0;
+      if(d.dstActive){
+        const dstH = Math.round(dstSec/3600*100)/100;
+        dstEl.textContent = '🌞 ACTIVE (+' + dstH + 'h)';
+        dstEl.style.color = '#E65100';
+      } else {
+        dstEl.textContent = '❄️ Standard';
+        dstEl.style.color = '#1565C0';
+      }
+    }
+
+    const sutcEl = document.getElementById('sutc');
+    if(sutcEl){
+      const utcStr = (typeof d.utcEpoch === 'string') ? d.utcEpoch : String(d.utcEpoch || '');
+      sutcEl.textContent = (utcStr && utcStr !== '0') ? utcStr : '\u2014';
+    }
+
+    const sntEl = document.getElementById('snt');
+    if(sntEl){
+      const ntpAge = safeAge(d.ntpSyncAge);
+      sntEl.textContent = ntpAge >= 0 ? fmtAge(ntpAge) : 'Never';
+    }
+
+    const sbsEl = document.getElementById('sbs');
+    if(sbsEl){
+      const bsAge = safeAge(d.browserSyncAge);
+      sbsEl.textContent = bsAge >= 0 ? fmtAge(bsAge) : 'Never';
+    }
+
+    const snsEl = document.getElementById('sns');
+    if(snsEl) snsEl.textContent = (typeof d.ntpServer === 'string' && d.ntpServer) ? d.ntpServer : '\u2014';
+
+    const schEl = document.getElementById('sch');
+    if(schEl) schEl.textContent = (typeof d.chipModel === 'string' && d.chipModel) ? d.chipModel : 'ESP32';
+
+    const smdnsEl = document.getElementById('smdns');
+    if(smdnsEl){
+      if(d.mdnsStarted){
+        smdnsEl.textContent = (typeof d.mdnsHostname === 'string' && d.mdnsHostname) ? d.mdnsHostname + '.local' : '\u2014';
+      } else {
+        smdnsEl.textContent = 'Not running';
+      }
+    }
+
+    const srcEl = document.getElementById('src');
+    if(srcEl){
+      const rc = (typeof d.relayCount === 'number' && isFinite(d.relayCount)) ? d.relayCount : 0;
+      const mr = (typeof d.maxRelays === 'number' && isFinite(d.maxRelays)) ? d.maxRelays : 16;
+      srcEl.textContent = rc + ' / ' + mr;
+    }
+
+    const sgmtEl = document.getElementById('sgmt');
+    if(sgmtEl) sgmtEl.textContent = formatGmtOffset(d.gmtOffset);
+
+    const sdriftEl = document.getElementById('sdrift');
+    if(sdriftEl){
+      const dc = (typeof d.driftComp === 'number' && isFinite(d.driftComp) && d.driftComp > 0) ? d.driftComp : 1.0;
+      sdriftEl.textContent = dc.toFixed(4);
+    }
+
+    const sactEl = document.getElementById('sactmode');
+    if(sactEl){
+      let modeText = '🔧 Per-Relay';
+      if(d.globalActiveMode === 1) modeText = '🌍 Global LOW';
+      else if(d.globalActiveMode === 2) modeText = '🌍 Global HIGH';
+      sactEl.textContent = modeText;
+    }
+
+    const srtcEl = document.getElementById('srtc');
+    if(srtcEl){
+      srtcEl.textContent = d.rtcPresent ? '✅ Present' : '❌ Not detected';
+      srtcEl.style.color = d.rtcPresent ? '#2E7D32' : '#C62828';
+    }
+
+    const srtcsyncEl = document.getElementById('srtcsync');
+    if(srtcsyncEl){
+      const rtcAge = safeAge(d.rtcSyncAge);
+      srtcsyncEl.textContent = rtcAge >= 0 ? fmtAge(rtcAge) : 'Never';
+    }
+
     const tEl = document.getElementById('srtctemp');
-    if (d.rtcTemp === null || d.rtcTemp === undefined) {
+    if(tEl){
+      if(d.rtcTemp === null || d.rtcTemp === undefined || typeof d.rtcTemp !== 'number' || !isFinite(d.rtcTemp)){
         tEl.textContent = '\u2014';
         tEl.style.color = '#90A4AE';
-    } else {
+      } else {
         tEl.textContent = d.rtcTemp.toFixed(2) + ' \u00B0C';
-        if (d.rtcTemp < 15)       tEl.style.color = '#1565C0';
-        else if (d.rtcTemp < 35)  tEl.style.color = '#2E7D32';
-        else if (d.rtcTemp < 50)  tEl.style.color = '#F9A825';
-        else                       tEl.style.color = '#C62828';
+        if(d.rtcTemp < 0)        tEl.style.color = '#0D47A1';
+        else if(d.rtcTemp < 10)  tEl.style.color = '#1565C0';
+        else if(d.rtcTemp < 20)  tEl.style.color = '#0288D1';
+        else if(d.rtcTemp < 30)  tEl.style.color = '#2E7D32';
+        else if(d.rtcTemp < 40)  tEl.style.color = '#F9A825';
+        else if(d.rtcTemp < 50)  tEl.style.color = '#EF6C00';
+        else                     tEl.style.color = '#C62828';
+      }
     }
-    document.getElementById('ssyncdir').textContent = d.syncDirection || 'Not available';
-    const staStatus = d.staEnabled ? (d.wifiConnected ? '✅ Connected' : '⚠️ Enabled but disconnected') : '❌ Disabled';
-    document.getElementById('stawifi').textContent = staStatus;
-    if(d.staEnabled && d.wifiConnected) document.getElementById('stawifi').style.color='#2E7D32';
-    else if(d.staEnabled) document.getElementById('stawifi').style.color='#F9A825';
-    else document.getElementById('stawifi').style.color='#C62828';
-  }).catch(()=>{});
+
+    const ssyncEl = document.getElementById('ssyncdir');
+    if(ssyncEl){
+      ssyncEl.textContent = (typeof d.syncDirection === 'string' && d.syncDirection) ? d.syncDirection : 'Not available';
+    }
+
+    const stawifiEl = document.getElementById('stawifi');
+    if(stawifiEl){
+      const staStatus = d.staEnabled ? (d.wifiConnected ? '✅ Connected' : '⚠️ Enabled but disconnected') : '❌ Disabled';
+      stawifiEl.textContent = staStatus;
+      if(d.staEnabled && d.wifiConnected) stawifiEl.style.color = '#2E7D32';
+      else if(d.staEnabled) stawifiEl.style.color = '#F9A825';
+      else stawifiEl.style.color = '#C62828';
+    }
+  }).catch(()=>{
+    const el = document.getElementById('stsrc');
+    if(el && !el.textContent) el.textContent = '\u2014';
+  });
 }
-loadSys();setInterval(loadSys,5000);
+loadSys();
+setInterval(loadSys, 5000);
+
 function rst(){
   if(!confirm('Verify all services without restarting? This will check WiFi, web server, DNS, and mDNS.'))return;
   fetch('/api/reset',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.success)toast('Services verified!');
+    if(d && d.success)toast('Services verified!');
     else toast('Verification failed',false);
   }).catch(()=>toast('Error',false));
 }
+
 function fct(){
   if(!confirm('FACTORY RESET \u2014 ALL settings will be erased. Continue?'))return;
   fetch('/api/factory-reset',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.success)toast('Factory reset complete');
+    if(d && d.success)toast('Factory reset complete');
     else toast('Reset failed',false);
   }).catch(()=>{});
   setTimeout(()=>window.location.reload(),15000);
@@ -3136,25 +3165,10 @@ void updateNTPSync() {
         case 0:
             if (ntpRetryCount == 0 && strlen(sysConfig.ntp_server) > 0) {
                 startNTPRequest(sysConfig.ntp_server);
-            } else if (ntpRetryCount >= 1 && ntpRetryCount <= NUM_NTP_SERVERS) {
-                uint8_t idx = (uint8_t)(ntpRetryCount - 1);
+            } else if (ntpRetryCount <= NUM_NTP_SERVERS) {
+                uint8_t idx = (ntpRetryCount == 0) ? 0 : (ntpRetryCount - 1);
                 if (idx < NUM_NTP_SERVERS) {
-                    if (strcmp(NTP_SERVERS[idx], sysConfig.ntp_server) != 0) {
-                        startNTPRequest(NTP_SERVERS[idx]);
-                    } else if (idx + 1 < NUM_NTP_SERVERS) {
-                        startNTPRequest(NTP_SERVERS[idx + 1]);
-                        ntpRetryCount++;
-                    } else {
-                        ntpFailCount++;
-                        ntpRetryCount = 0;
-                        ntpAsyncStage = 0;
-                        ntpAsyncState = NTP_STATE_IDLE;
-                    }
-                } else {
-                    ntpFailCount++;
-                    ntpRetryCount = 0;
-                    ntpAsyncStage = 0;
-                    ntpAsyncState = NTP_STATE_IDLE;
+                    startNTPRequest(NTP_SERVERS[idx]);
                 }
             } else {
                 ntpFailCount++;
@@ -3353,8 +3367,7 @@ inline bool isSingleScheduleSlotActive(uint64_t epoch,
             if (sched.days[slot] & (1 << currentWeekday)) return true;
             return false;
         } else if (cur < stop) {
-            uint64_t checkEpoch = epoch - 86400ULL;
-            uint64_t checkLocalEpoch = getLocalEpoch(checkEpoch);
+            uint64_t checkLocalEpoch = getLocalEpoch(epoch) - 86400ULL;
             struct tm* checkDate = gmtime64(&checkLocalEpoch);
             if (!checkDate) return false;
             if (!(monthMask & (1 << checkDate->tm_mon))) return false;
@@ -3964,6 +3977,12 @@ void handleManualControl() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>() ||
+        !doc.containsKey("state") || !doc["state"].is<bool>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay/state\"}");
+        return;
+    }
     int relay = doc["relay"];
     bool state = doc["state"];
     if (relay >= 0 && relay < gpioConfig.count) {
@@ -3972,6 +3991,8 @@ void handleManualControl() {
         scheduleActiveCache[relay] = false;
         setRelayOutput(relay, state);
         lastRelayOutputs[relay] = state;
+        lastDebouncedStateGlobal[relay] = state;
+        lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
         server.send(200, "application/json", "{\"success\":true}");
     } else {
@@ -3990,17 +4011,18 @@ void handleResetManual() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay\"}");
+        return;
+    }
     int relay = doc["relay"];
     if (relay >= 0 && relay < gpioConfig.count) {
         relayConfigs[relay].manualOverride = false;
         updateScheduleCache();
-        bool targetState = scheduleActiveCache[relay];
-        setRelayOutput(relay, targetState);
-        lastRelayOutputs[relay] = targetState;
-        lastDebouncedStateGlobal[relay] = targetState;
-        lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
         server.send(200, "application/json", "{\"success\":true}");
+        processRelaySchedules();
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
     }
@@ -4026,12 +4048,12 @@ void handleSaveRelay() {
     int s = 0;
     for (JsonObject sch : schedules) {
         if (s >= 8) break;
-        int shRaw = sch["startHour"]   | 0; if (shRaw < 0) shRaw = 0; if (shRaw > 23) shRaw = 23; uint8_t sh = (uint8_t)shRaw;
-        int smRaw = sch["startMinute"] | 0; if (smRaw < 0) smRaw = 0; if (smRaw > 59) smRaw = 59; uint8_t sm = (uint8_t)smRaw;
-        int ssRaw = sch["startSecond"] | 0; if (ssRaw < 0) ssRaw = 0; if (ssRaw > 59) ssRaw = 59; uint8_t ss = (uint8_t)ssRaw;
-        int ehRaw = sch["stopHour"]    | 0; if (ehRaw < 0) ehRaw = 0; if (ehRaw > 23) ehRaw = 23; uint8_t eh = (uint8_t)ehRaw;
-        int emRaw = sch["stopMinute"]  | 0; if (emRaw < 0) emRaw = 0; if (emRaw > 59) emRaw = 59; uint8_t em = (uint8_t)emRaw;
-        int esRaw = sch["stopSecond"]  | 0; if (esRaw < 0) esRaw = 0; if (esRaw > 59) esRaw = 59; uint8_t es = (uint8_t)esRaw;
+        uint8_t sh = sch["startHour"]   | 0; if (sh > 23) sh = 23;
+        uint8_t sm = sch["startMinute"] | 0; if (sm > 59) sm = 59;
+        uint8_t ss = sch["startSecond"] | 0; if (ss > 59) ss = 59;
+        uint8_t eh = sch["stopHour"]    | 0; if (eh > 23) eh = 23;
+        uint8_t em = sch["stopMinute"]  | 0; if (em > 59) em = 59;
+        uint8_t es = sch["stopSecond"]  | 0; if (es > 59) es = 59;
         relayConfigs[relay].schedule.startHour[s]   = sh;
         relayConfigs[relay].schedule.startMinute[s] = sm;
         relayConfigs[relay].schedule.startSecond[s] = ss;
@@ -4048,11 +4070,11 @@ void handleSaveRelay() {
         } else {
             relayConfigs[relay].schedule.days[s] = DAY_ALL;
         }
-        if (sch.containsKey("monthDays")) {
-            relayConfigs[relay].schedule.monthDays[s] = sch["monthDays"].as<uint32_t>() & 0x7FFFFFFFUL;
-        } else {
-            relayConfigs[relay].schedule.monthDays[s] = 0x7FFFFFFFUL;
+        uint32_t rawMonthDays = 0x7FFFFFFFUL;
+        if (sch.containsKey("monthDays") && sch["monthDays"].is<uint32_t>()) {
+            rawMonthDays = sch["monthDays"].as<uint32_t>();
         }
+        relayConfigs[relay].schedule.monthDays[s] = rawMonthDays & 0x7FFFFFFFUL;
         if (sch.containsKey("monthMask")) {
             relayConfigs[relay].schedule.monthMask[s] = sch["monthMask"].as<uint16_t>() & 0x0FFF;
         } else {
@@ -4091,16 +4113,15 @@ void handleRelayName() {
     int relay = doc["relay"];
     const char* name = doc["name"];
     if (relay >= 0 && relay < gpioConfig.count && name) {
-        size_t maxCopy = 15;
-        size_t len = strlen(name);
-        if (len > maxCopy) {
-            len = maxCopy;
-            while (len > 0 && ((uint8_t)name[len] & 0xC0) == 0x80) {
-                len--;
+        size_t nlen = strlen(name);
+        if (nlen > 15) {
+            nlen = 15;
+            while (nlen > 0 && ((uint8_t)name[nlen] & 0xC0) == 0x80) {
+                nlen--;
             }
         }
-        memcpy(relayConfigs[relay].name, name, len);
-        relayConfigs[relay].name[len] = '\0';
+        memcpy(relayConfigs[relay].name, name, nlen);
+        relayConfigs[relay].name[nlen] = '\0';
         saveConfiguration();
         server.send(200, "application/json", "{\"success\":true}");
     } else {
@@ -4157,11 +4178,10 @@ void handleGetTime() {
 
 void handleGetWiFi() {
     DynamicJsonDocument doc(384);
-    bool liveConnected = extConfig.sta_enabled && (WiFi.status() == WL_CONNECTED);
     doc["ssid"] = sysConfig.sta_ssid;
-    doc["connected"] = liveConnected;
-    doc["ip"] = liveConnected ? WiFi.localIP().toString() : String("");
-    doc["rssi"] = liveConnected ? (int)WiFi.RSSI() : 0;
+    doc["connected"] = wifiConnected;
+    doc["ip"] = WiFi.localIP().toString();
+    doc["rssi"] = wifiConnected ? (int)WiFi.RSSI() : 0;
     doc["sta_enabled"] = extConfig.sta_enabled ? true : false;
     String resp;
     serializeJson(doc, resp);
@@ -4181,10 +4201,8 @@ void handleSaveWiFi() {
     }
     if (doc.containsKey("sta_enabled")) {
         bool enable = doc["sta_enabled"];
-        server.send(200, "application/json", "{\"success\":true,\"sta_enabled\":" + String(enable ? "true" : "false") + "}");
-        server.client().flush();
-        delay(100);
         setWiFiStationEnabled(enable);
+        server.send(200, "application/json", "{\"success\":true,\"sta_enabled\":" + String(enable ? "true" : "false") + "}");
         return;
     }
     const char* ssidRaw = doc["ssid"];
@@ -4203,50 +4221,49 @@ void handleSaveWiFi() {
     memcpy(ssidTrim, ssidRaw + s0, outLen);
     ssidTrim[outLen] = '\0';
     const char* ssid = ssidTrim;
-    if (strlen(ssid) == 0 || strlen(ssid) >= 32) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid SSID\"}");
-        return;
-    }
-    bool ssidChanged = (strcmp(sysConfig.sta_ssid, ssid) != 0);
-    bool passChanged = false;
-    strncpy(sysConfig.sta_ssid, ssid, 31);
-    sysConfig.sta_ssid[31] = '\0';
-    if (doc.containsKey("password")) {
-        JsonVariant pwVar = doc["password"];
-        if (pwVar.is<const char*>()) {
-            const char* pw = pwVar.as<const char*>();
-            if (pw && strlen(pw) > 0) {
-                size_t pwLen = strlen(pw);
-                if (pwLen > 63) pwLen = 63;
-                passChanged = (strncmp(sysConfig.sta_password, pw, pwLen) != 0) ||
-                              (sysConfig.sta_password[pwLen] != '\0');
-                memcpy(sysConfig.sta_password, pw, pwLen);
-                sysConfig.sta_password[pwLen] = '\0';
+    if (strlen(ssid) > 0 && strlen(ssid) < 32) {
+        bool ssidChanged = (strcmp(sysConfig.sta_ssid, ssid) != 0);
+        bool passChanged = false;
+        strncpy(sysConfig.sta_ssid, ssid, 31);
+        sysConfig.sta_ssid[31] = '\0';
+        if (doc.containsKey("password")) {
+            if (doc["password"].is<const char*>()) {
+                const char* pw = doc["password"];
+                if (pw && strlen(pw) > 0) {
+                    passChanged = (strcmp(sysConfig.sta_password, pw) != 0);
+                    strncpy(sysConfig.sta_password, pw, 63);
+                    sysConfig.sta_password[63] = '\0';
+                } else {
+                    passChanged = (sysConfig.sta_password[0] != '\0');
+                    sysConfig.sta_password[0] = '\0';
+                }
             } else {
                 passChanged = (sysConfig.sta_password[0] != '\0');
                 sysConfig.sta_password[0] = '\0';
             }
+        } else if (ssidChanged) {
+            passChanged = (sysConfig.sta_password[0] != '\0');
+            sysConfig.sta_password[0] = '\0';
         }
-    } else if (ssidChanged) {
-        passChanged = (sysConfig.sta_password[0] != '\0');
-        sysConfig.sta_password[0] = '\0';
-    }
-    saveConfiguration();
-    if (extConfig.sta_enabled && (ssidChanged || passChanged)) {
-        wifiPausedForScan = false;
-        WiFi.disconnect(false, false);
-        delay(100);
-        wifiConnected = false;
-        wifiConnecting = true;
-        wifiConnectStart = millis();
-        wifiReconnectAttempts = 0;
-        wifiGiveUpUntil = 0;
-        if (WiFi.getMode() != WIFI_AP_STA) {
-            WiFi.mode(WIFI_AP_STA);
+        saveConfiguration();
+        if (extConfig.sta_enabled && (ssidChanged || passChanged)) {
+            wifiPausedForScan = false;
+            WiFi.disconnect(false, false);
+            delay(500);
+            wifiConnected = false;
+            wifiConnecting = true;
+            wifiConnectStart = millis();
+            wifiReconnectAttempts = 0;
+            wifiGiveUpUntil = 0;
+            if (WiFi.getMode() != WIFI_AP_STA) {
+                WiFi.mode(WIFI_AP_STA);
+            }
+            WiFi.begin(sysConfig.sta_ssid, sysConfig.sta_password);
         }
-        WiFi.begin(sysConfig.sta_ssid, sysConfig.sta_password);
+        server.send(200, "application/json", "{\"success\":true}");
+    } else {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid SSID\"}");
     }
-    server.send(200, "application/json", "{\"success\":true}");
 }
 
 void handleWiFiScanStart() {
@@ -4412,7 +4429,6 @@ void handleSaveNTP() {
     }
     if (hasGmtOffset) {
         sysConfig.gmt_offset = newGmtOffset;
-        sysConfig.daylight_offset = 0;
         strcpy(sysConfig.tz_name, "Manual");
         sysConfig.tz_auto_dst = 0;
         changed = true;
@@ -4479,20 +4495,10 @@ void handleSaveAP() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
     }
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
-        return;
-    }
-    if (!doc.containsKey("ap_ssid")) {
-        server.send(400, "application/json",
-            "{\"success\":false,\"error\":\"Missing ap_ssid\"}");
-        return;
-    }
-    if (!doc["ap_ssid"].is<const char*>()) {
-        server.send(400, "application/json",
-            "{\"success\":false,\"error\":\"ap_ssid must be a string\"}");
         return;
     }
     const char* ssid = doc["ap_ssid"];
@@ -4501,14 +4507,6 @@ void handleSaveAP() {
     bool passChanged = false;
     bool channelChanged = false;
     bool hiddenChanged = false;
-    if (doc.containsKey("ap_channel")) {
-        int chRaw = doc["ap_channel"] | -1;
-        if (chRaw < 1 || chRaw > 13) {
-            server.send(400, "application/json",
-                "{\"success\":false,\"error\":\"Channel must be 1-13\"}");
-            return;
-        }
-    }
     if (ssid && strlen(ssid) > 0 && strlen(ssid) < 32) {
         ssidChanged = (strcmp(sysConfig.ap_ssid, ssid) != 0);
         strncpy(sysConfig.ap_ssid, ssid, 31);
@@ -4544,19 +4542,14 @@ void handleSaveAP() {
         }
     }
     if (doc.containsKey("ap_channel")) {
-        uint8_t ch = (uint8_t)(doc["ap_channel"] | 6);
-        if (ch != extConfig.ap_channel) {
+        uint8_t ch = doc["ap_channel"];
+        if (ch >= 1 && ch <= 13 && ch != extConfig.ap_channel) {
             extConfig.ap_channel = ch;
             channelChanged = true;
         }
     }
     if (doc.containsKey("ap_hidden")) {
-        if (!doc["ap_hidden"].is<bool>()) {
-            server.send(400, "application/json",
-                "{\"success\":false,\"error\":\"ap_hidden must be a boolean\"}");
-            return;
-        }
-        bool newHidden = doc["ap_hidden"].as<bool>();
+        bool newHidden = doc["ap_hidden"] ? 1 : 0;
         if (newHidden != extConfig.ap_hidden) {
             extConfig.ap_hidden = newHidden;
             hiddenChanged = true;
@@ -4568,7 +4561,12 @@ void handleSaveAP() {
     if (needsRestart) {
         server.send(200, "application/json", "{\"success\":true,\"restarted\":true}");
         server.client().flush();
-        delay(800);
+        delay(200);
+        yield();
+        server.client().flush();
+        delay(1200);
+        yield();
+        server.client().flush();
         healer.restartAPIfNeeded(true);
     } else {
         server.send(200, "application/json", "{\"success\":true,\"restarted\":false}");
@@ -4576,7 +4574,7 @@ void handleSaveAP() {
 }
 
 void handleGetSystem() {
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(3072);
     doc["ip"] = WiFi.localIP().toString();
     doc["ap_ip"] = WiFi.softAPIP().toString();
     doc["uptime"] = (uint64_t)(esp_timer_get_time() / 1000000ULL);
@@ -4587,14 +4585,16 @@ void handleGetSystem() {
     String timeSourceStr = "None";
     if (timeSource == TIME_SOURCE_NTP) timeSourceStr = "NTP";
     else if (timeSource == TIME_SOURCE_BROWSER) timeSourceStr = "Browser";
-    else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = "RTC";
+    else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = rtcPresent ? "DS3231" : "Internal RTC";
     doc["timeSource"] = timeSourceStr;
     if (timeSource == TIME_SOURCE_NTP) {
-        doc["syncDirection"] = "NTP \u2192 RTC \u2192 DS3231";
+        doc["syncDirection"] = rtcPresent ? "NTP \u2192 RTC \u2192 DS3231" : "NTP \u2192 Internal RTC";
     } else if (timeSource == TIME_SOURCE_BROWSER) {
-        doc["syncDirection"] = "Browser \u2192 RTC \u2192 DS3231";
+        doc["syncDirection"] = rtcPresent ? "Browser \u2192 RTC \u2192 DS3231" : "Browser \u2192 Internal RTC";
     } else if (timeSource == TIME_SOURCE_RTC && rtcPresent) {
         doc["syncDirection"] = "DS3231 \u2192 Internal RTC";
+    } else if (timeSource == TIME_SOURCE_RTC && !rtcPresent) {
+        doc["syncDirection"] = "Internal RTC (NVS)";
     } else {
         doc["syncDirection"] = "None";
     }
@@ -4755,13 +4755,32 @@ void handleSaveGPIOConfig() {
     gpioConfig.count = newCount;
     int idx = 0;
     for (JsonVariant pin : pins) {
-        gpioConfig.pins[idx] = pin.as<uint8_t>();
+        uint8_t newPinVal = pin.as<uint8_t>();
+        gpioConfig.pins[idx] = newPinVal;
         if (idx < MAX_RELAYS) {
-            relayConfigs[idx].manualOverride = oldManualOverride[idx];
-            relayConfigs[idx].manualState = oldManualState[idx];
-            strcpy(relayConfigs[idx].name, oldNames[idx]);
-            relayConfigs[idx].schedule = oldSchedules[idx];
-            gpioConfig.activeLow[idx] = oldActiveLow[idx];
+            int matchIdx = -1;
+            for (uint8_t k = 0; k < oldCount; k++) {
+                if (oldPins[k] == newPinVal) { matchIdx = k; break; }
+            }
+            if (matchIdx >= 0) {
+                relayConfigs[idx].manualOverride = oldManualOverride[matchIdx];
+                relayConfigs[idx].manualState    = oldManualState[matchIdx];
+                strncpy(relayConfigs[idx].name, oldNames[matchIdx], 15);
+                relayConfigs[idx].name[15] = '\0';
+                relayConfigs[idx].schedule       = oldSchedules[matchIdx];
+                gpioConfig.activeLow[idx]        = oldActiveLow[matchIdx];
+            } else {
+                relayConfigs[idx].manualOverride = false;
+                relayConfigs[idx].manualState    = false;
+                snprintf(relayConfigs[idx].name, 16, "Relay %d", idx + 1);
+                memset(&relayConfigs[idx].schedule, 0, sizeof(TimerSchedule));
+                for (int s = 0; s < 8; s++) {
+                    relayConfigs[idx].schedule.days[s]      = DAY_ALL;
+                    relayConfigs[idx].schedule.monthDays[s] = 0x7FFFFFFFUL;
+                    relayConfigs[idx].schedule.monthMask[s] = MONTH_ALL;
+                }
+                gpioConfig.activeLow[idx] = true;
+            }
             relayConfigs[idx].magic = RELAY_CONFIG_MAGIC;
         }
         idx++;
@@ -4785,8 +4804,11 @@ void handleSaveGPIOConfig() {
     }
     for (uint8_t i = 0; i < gpioConfig.count; i++) {
         pinMode(gpioConfig.pins[i], OUTPUT);
-        bool preserve = (i < oldCount) && (oldPins[i] == gpioConfig.pins[i]);
-        bool state = preserve ? oldRelayOutputs[i] : false;
+        int matchIdx = -1;
+        for (uint8_t k = 0; k < oldCount; k++) {
+            if (oldPins[k] == gpioConfig.pins[i]) { matchIdx = k; break; }
+        }
+        bool state = (matchIdx >= 0) ? oldRelayOutputs[matchIdx] : false;
         setRelayOutput(i, state);
         lastRelayOutputs[i] = state;
         lastDebouncedStateGlobal[i] = state;
@@ -4877,9 +4899,14 @@ void handleDeleteGPIO() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid index\"}");
         return;
     }
-    uint8_t deletedPin = gpioConfig.pins[index];
+    uint8_t removedPin = gpioConfig.pins[index];
+    bool removedActiveLow = gpioConfig.activeLow[index];
+    if (extConfig.global_active_mode == 1) removedActiveLow = true;
+    else if (extConfig.global_active_mode == 2) removedActiveLow = false;
     setRelayOutput(index, false);
-    pinMode(deletedPin, INPUT);
+    delay(1);
+    digitalWrite(removedPin, removedActiveLow ? HIGH : LOW);
+    pinMode(removedPin, INPUT);
     for (uint8_t i = index; i < gpioConfig.count - 1; i++) {
         gpioConfig.pins[i] = gpioConfig.pins[i + 1];
         gpioConfig.activeLow[i] = gpioConfig.activeLow[i + 1];
