@@ -2121,7 +2121,6 @@ function saveWiFi(){
     });
 }
 loadWiFiStatus();
-setInterval(loadWiFiStatus, 5000);
 </script></body></html>)raw";
 
 // =============================================================================
