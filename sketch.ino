@@ -3366,7 +3366,7 @@ void tryNTPSync() {
         return;
     }
     unsigned long now = millis();
-    if (!timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) {
+    if (lastNTPAttempt != 0 && !timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) {
         return;
     }
     lastNTPAttempt = now;
