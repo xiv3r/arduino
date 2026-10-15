@@ -1,6 +1,6 @@
 /*
 ===============================================================================
- *  ESP32 16-Channel Automatic Relay Timer Switch w/ Full MQTT 
+ *  ESP32 16-Channel Automatic Relay Timer Switch
  *  Author: Raff Alds
  *  Github: https://www.github.com/xiv3r
  *  License: GPLv3
@@ -422,16 +422,23 @@ int32_t currentDstOffset(uint64_t utcEpoch);
 uint8_t findTzByName(const char* name);
 
 // =============================================================================
-//  MQTT
+//  MQTT — Generic MQTT 3.1.1 / 3.1 Client (built-in, no external libraries)
+//  Full feature set: QoS 0/1/2, retain, LWT, birth, clean/persistent sessions,
+//  keepalive, TLS (insecure / fingerprint / CA / mutual TLS), user auth,
+//  wildcards, templated topics, generic subscription rules, HA discovery.
 // =============================================================================
 #define MQTT_CFG_MAGIC       0x7E51
 #define MQTT_CFG_VERSION     1
 #define MAX_MQTT_RULES       12
+
+// TLS modes
 #define MQTT_TLS_OFF         0
 #define MQTT_TLS_INSECURE    1
 #define MQTT_TLS_FINGERPRINT 2
 #define MQTT_TLS_CA          3
 #define MQTT_TLS_CA_CLIENT   4
+
+// Generic rule / command actions
 #define MQTT_ACT_LOG        0
 #define MQTT_ACT_RELAY_SET  1
 #define MQTT_ACT_RELAY_ON   2
@@ -445,18 +452,23 @@ uint8_t findTzByName(const char* name);
 #define MQTT_ACT_STATUS     10
 #define MQTT_ACT_RESTART    11
 #define MQTT_ACT_TIMESYNC   12
+
+// Engine states
 #define MQTT_ST_OFF        0
 #define MQTT_ST_WAIT       1
 #define MQTT_ST_CONNECTING 2
 #define MQTT_ST_CONNACK    3
 #define MQTT_ST_CONNECTED  4
+
+// Topic template tokens: %b (base topic) %id% (client id) %mac% %ip% %host%
 struct MqttRule {
     char    topic[80];
     uint8_t qos;
     uint8_t action;
-    int8_t  relay; 
+    int8_t  relay;      // -1 = auto (from topic / payload)
     uint8_t enabled;
 } __attribute__((packed));
+
 struct MqttConfig {
     uint16_t magic;
     uint8_t  version;
@@ -465,18 +477,20 @@ struct MqttConfig {
     uint16_t port;
     char     clientId[40];
     uint8_t  autoClientId;
-    uint8_t  protocol31;      
-    uint16_t keepalive;       
+    uint8_t  protocol31;      // 0 = MQTT 3.1.1, 1 = MQTT 3.1 (MQIsdp)
+    uint16_t keepalive;       // seconds
     uint8_t  cleanSession;
     uint8_t  tlsMode;
-    char     tlsFp[80];      
+    char     tlsFp[112];      // SHA-256 cert fingerprint (64 hex, ':'/' ' separators allowed)
     char     user[32];
     char     pass[64];
+    // Last Will & Testament
     uint8_t  lwtEnabled;
     char     lwtTopic[96];
     char     lwtPayload[32];
     uint8_t  lwtQos;
     uint8_t  lwtRetain;
+    // Birth / availability message
     uint8_t  birthEnabled;
     char     birthTopic[96];
     char     birthPayload[32];
@@ -485,32 +499,40 @@ struct MqttConfig {
     char     availTopic[96];
     char     availOnline[24];
     char     availOffline[24];
+    // Topics (templated)
     char     baseTopic[96];
     char     cmdTopic[96];
     char     stateTopic[96];
     char     teleTopic[96];
     char     ackTopic[96];
+    // Payload customization
     char     onPayload[20];
     char     offPayload[20];
     char     togPayload[20];
-    uint8_t  jsonState;      
+    uint8_t  jsonState;       // publish states as JSON instead of plain payload
+    // Publishing
     uint8_t  pubQos;
     uint8_t  pubRetain;
     uint8_t  pubOnChange;
-    uint16_t teleInterval;    
+    uint16_t teleInterval;    // seconds, 0 = off
+    // Home Assistant MQTT discovery
     uint8_t  haEnabled;
     char     haPrefix[48];
-    uint8_t  haComponent;    
-    uint16_t reconnectMin;    
-    uint16_t reconnectMax;   
-    uint16_t connectTimeout;  
-    uint16_t bufSize;         
+    uint8_t  haComponent;     // 0 = switch, 1 = light, 2 = fan
+    // Advanced
+    uint16_t reconnectMin;    // seconds
+    uint16_t reconnectMax;    // seconds
+    uint16_t connectTimeout;  // seconds
+    uint16_t bufSize;         // RX/TX buffer bytes (256..4096)
     uint8_t  subscribeQos;
     uint8_t  ackEnable;
-    uint8_t  cmdEnable;       
+    uint8_t  cmdEnable;       // subscribe to built-in command topics
+    // Generic subscription rules
     MqttRule rules[MAX_MQTT_RULES];
     uint8_t  reserved[8];
 } __attribute__((packed));
+
+// Runtime status (reported to the web UI)
 struct MqttStatusInfo {
     uint8_t  state;
     bool     sessionPresent;
@@ -525,13 +547,17 @@ struct MqttStatusInfo {
     char     lastTopic[96];
     char     lastPayload[48];
 };
+
+// Message log ring buffer (web console)
 #define MQTT_LOG_LINES 20
 struct MqttLogEntry {
-    char     dir;            
-    uint32_t t;               
+    char     dir;             // '>' out, '<' in, '*' info
+    uint32_t t;               // millis timestamp
     char     topic[64];
     char     payload[40];
 };
+
+// Forward declarations — MQTT subsystem
 void mqttLoadConfig();
 void mqttSaveConfig();
 void mqttBegin();
@@ -547,6 +573,7 @@ void handleSaveMqtt();
 void handleMqttReconnect();
 void handleMqttPublish();
 void handleMqttLog();
+
 
 // =============================================================================
 //  64-bit Conversion Helpers
@@ -3318,12 +3345,12 @@ const char mqtt_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="fg"><label>TLS Mode</label><select id="tlsMode" onchange="tlsUI()">
 <option value="0">0 &mdash; Disabled (plain TCP)</option>
 <option value="1">1 &mdash; TLS, insecure (no verification)</option>
-<option value="2">2 &mdash; TLS, certificate fingerprint</option>
+<option value="2">2 &mdash; TLS, certificate fingerprint (SHA-256)</option>
 <option value="3">3 &mdash; TLS, CA certificate (verified)</option>
 <option value="4">4 &mdash; TLS, CA + client certificate (mutual TLS)</option>
 </select></div>
-<div class="fg" id="fpRow" style="display:none"><label>Certificate Fingerprint (hex)</label>
-<input type="text" id="tlsFp" maxlength="79" placeholder="A1B2C3... (SHA1 40 hex or SHA256 64 hex)">
+<div class="fg" id="fpRow" style="display:none"><label>Certificate Fingerprint (SHA-256, hex)</label>
+<input type="text" id="tlsFp" maxlength="96" placeholder="A1B2C3... (SHA-256: 64 hex, ':'-separated ok)">
 <small>SHA1 = 40 hex chars, SHA256 = 64 hex chars. Colons optional (stripped automatically).</small></div>
 <div class="fg certRow" style="display:none"><label>CA Certificate (PEM)</label>
 <textarea id="caCert" rows="5" style="width:100%;padding:9px 12px;border:1px solid #CFD8DC;border-radius:7px;font-size:11px;font-family:monospace;background:#FAFAFA" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea></div>
@@ -4216,21 +4243,24 @@ String getMDNSHostname() {
 }
 
 // =============================================================================
-//  MQTT ENGINE
+//  MQTT ENGINE — built-in generic MQTT 3.1.1 / 3.1 client implementation
 // =============================================================================
 static MqttConfig     mqttCfg;
 static MqttStatusInfo mqttSt;
 static MqttLogEntry   mqttLog[MQTT_LOG_LINES];
 static uint8_t        mqttLogHead = 0;
 static uint8_t        mqttLogCount = 0;
+
 static WiFiClient       mqttTcp;
 static WiFiClientSecure mqttSsl;
 static WiFiClient*      mqttNet = nullptr;
+
 static uint8_t* mqttRxBuf = nullptr;
 static size_t   mqttRxLen = 0;
 static size_t   mqttRxCap = 0;
 static uint8_t* mqttTxBuf = nullptr;
 static size_t   mqttTxCap = 0;
+
 static uint8_t  mqttState = MQTT_ST_OFF;
 static bool     mqttAwaitingConnack = false;
 static unsigned long mqttConnackDeadline = 0;
@@ -4242,14 +4272,18 @@ static unsigned long mqttLastTele = 0;
 static unsigned long mqttConnectedAt = 0;
 static uint16_t mqttNextPid = 1;
 static bool     mqttSessionPresent = false;
+
+// TLS material (heap, loaded on demand)
 static String mqttCaCert;
 static String mqttClientCert;
 static String mqttClientKey;
+
+// Outgoing QoS 1/2 inflight tracking (for ack + retransmission)
 struct MqttOut {
     bool     active;
-    bool     retryable;   
+    bool     retryable;   // false when payload exceeded retry storage
     uint16_t id;
-    uint8_t  kind; 
+    uint8_t  kind;        // 0 = PUBLISH wait PUBACK (QoS1), 1 = PUBLISH wait PUBREC (QoS2), 2 = PUBREL wait PUBCOMP
     bool     retain;
     unsigned long sentAt;
     uint16_t tlen;
@@ -4259,6 +4293,8 @@ struct MqttOut {
 };
 #define MQTT_MAX_INFLIGHT 8
 static MqttOut mqttOut[MQTT_MAX_INFLIGHT];
+
+// Incoming QoS 2 dedup (packet ids awaiting PUBREL)
 struct MqttInq {
     bool     used;
     uint16_t id;
@@ -4266,16 +4302,24 @@ struct MqttInq {
 };
 #define MQTT_MAX_INQ 8
 static MqttInq mqttInq[MQTT_MAX_INQ];
+
+// Published-state snapshot for change detection
 static bool mqttSnapState[MAX_RELAYS];
 static bool mqttSnapManual[MAX_RELAYS];
 static bool mqttSnapValid = false;
+
 static void mqttScheduleRetry();
+
+// -----------------------------------------------------------------------------
+//  Small helpers
+// -----------------------------------------------------------------------------
 static void mqttSetStr(char* dst, size_t n, const char* src) {
     if (!dst || n == 0) return;
     if (!src) { dst[0] = '\0'; return; }
     strncpy(dst, src, n - 1);
     dst[n - 1] = '\0';
 }
+
 static void mqttLogMsg(char dir, const char* topic, const char* payload) {
     MqttLogEntry& e = mqttLog[mqttLogHead];
     e.dir = dir;
@@ -4285,17 +4329,20 @@ static void mqttLogMsg(char dir, const char* topic, const char* payload) {
     mqttLogHead = (mqttLogHead + 1) % MQTT_LOG_LINES;
     if (mqttLogCount < MQTT_LOG_LINES) mqttLogCount++;
 }
+
 static void mqttInfo(const char* msg) {
     mqttSetStr(mqttSt.lastError, sizeof(mqttSt.lastError), msg);
     mqttSt.lastErrorAt = millis();
     mqttLogMsg('*', "info", msg);
 }
+
 static void mqttErr(const char* msg) {
     mqttSt.errCount++;
     mqttSetStr(mqttSt.lastError, sizeof(mqttSt.lastError), msg);
     mqttSt.lastErrorAt = millis();
     mqttLogMsg('*', "error", msg);
 }
+
 static uint16_t mqttAllocPid() {
     for (int guard = 0; guard < 65535; guard++) {
         uint16_t id = mqttNextPid++;
@@ -4309,6 +4356,8 @@ static uint16_t mqttAllocPid() {
     }
     return 1;
 }
+
+// MQTT variable byte integer. Returns encoded size, or 0 if buffer too small.
 static size_t mqttEncodeVarInt(uint8_t* buf, size_t buflen, uint32_t value) {
     size_t n = 0;
     do {
@@ -4320,6 +4369,8 @@ static size_t mqttEncodeVarInt(uint8_t* buf, size_t buflen, uint32_t value) {
     } while (value > 0);
     return n;
 }
+
+// Decode variable byte integer. Sets *used; returns 0xFFFFFFFF if incomplete.
 static uint32_t mqttDecodeVarInt(const uint8_t* buf, size_t buflen, uint8_t* used) {
     uint32_t value = 0;
     uint32_t mult = 1;
@@ -4331,10 +4382,13 @@ static uint32_t mqttDecodeVarInt(const uint8_t* buf, size_t buflen, uint8_t* use
         if ((buf[i] & 0x80) == 0) return value;
         mult *= 128;
     }
-    return 0xFFFFFFFFu; 
+    return 0xFFFFFFFFu; // malformed (4 bytes with continuation)
 }
+
 static size_t mqttPutU16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)(v & 0xFF); return 2; }
 static uint16_t mqttGetU16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
+
+// Write MQTT UTF-8 string (2-byte length prefix). Returns bytes written, 0 on overflow.
 static size_t mqttPutStr(uint8_t* buf, size_t buflen, const char* s) {
     size_t len = s ? strlen(s) : 0;
     if (len > 65535 || buflen < len + 2) return 0;
@@ -4342,15 +4396,21 @@ static size_t mqttPutStr(uint8_t* buf, size_t buflen, const char* s) {
     if (len) memcpy(buf + 2, s, len);
     return len + 2;
 }
+
+// -----------------------------------------------------------------------------
+//  Topic filter matching (MQTT wildcards + and #)
+// -----------------------------------------------------------------------------
 bool mqttTopicMatch(const char* filter, const char* topic) {
     if (!filter || !topic) return false;
     const char* f = filter;
     const char* t = topic;
     while (*f && *t) {
         if (*f == '#') {
+            // multi-level: matches rest of topic (must be last level of filter)
             return (f[1] == '\0' || f[1] == '/');
         }
         if (*f == '+') {
+            // single level: skip to next level separator in both
             f++;
             while (*t && *t != '/') t++;
             while (*f && *f != '/') f++;
@@ -4359,11 +4419,15 @@ bool mqttTopicMatch(const char* filter, const char* topic) {
         if (*f != *t) return false;
         f++; t++;
     }
+    // trailing '#' matches zero or more levels (spec 4.7.1.2: "a/#" matches "a")
     if (*f == '#' && f[1] == '\0' && (f == filter || f[-1] == '/')) return true;
     if (*t == '\0' && f[0] == '/' && f[1] == '#' && f[2] == '\0') return true;
+    // trailing '+' matches an empty final level: "sport/+" matches "sport/"
     if (*t == '\0' && f[0] == '+' && f[1] == '\0') return true;
     return (*f == '\0' && *t == '\0');
 }
+
+// Resolve template tokens: %b (base topic), %id%, %mac%, %ip%, %host%
 static void mqttResolvedBase(char* out, size_t outlen) {
     char id[48];
     if (mqttCfg.autoClientId || mqttCfg.clientId[0] == '\0') {
@@ -4378,6 +4442,7 @@ static void mqttResolvedBase(char* out, size_t outlen) {
     } else {
         mqttSetStr(id, sizeof(id), mqttCfg.clientId);
     }
+    // substitution over baseTopic
     char host[32];
     mqttSetStr(host, sizeof(host), mdnsHostname);
     String macFull = WiFi.macAddress();
@@ -4388,6 +4453,7 @@ static void mqttResolvedBase(char* out, size_t outlen) {
     }
     macCompact.toLowerCase();
     IPAddress ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP() : WiFi.softAPIP();
+
     const char* in = mqttCfg.baseTopic[0] ? mqttCfg.baseTopic : "relay16/%id%";
     size_t o = 0;
     for (size_t i = 0; in[i] != '\0' && o + 1 < outlen; ) {
@@ -4415,6 +4481,7 @@ static void mqttResolvedBase(char* out, size_t outlen) {
     }
     out[o] = '\0';
 }
+
 static void mqttResolveTopic(const char* in, char* out, size_t outlen) {
     char base[96];
     mqttResolvedBase(base, sizeof(base));
@@ -4427,7 +4494,9 @@ static void mqttResolveTopic(const char* in, char* out, size_t outlen) {
             memcpy(out + o, base, l); o += l; i += 2;
         } else if (in[i] == '%' && strncmp(in + i, "%id%", 4) == 0) {
             char base2[96];
-            mqttResolvedBase(base2, sizeof(base2)); 
+            // reuse resolved base for id too (id is inside base already); extract from base resolution
+            mqttResolvedBase(base2, sizeof(base2)); // ensures same id logic
+            // resolve %id% directly:
             char id[48];
             if (mqttCfg.autoClientId || mqttCfg.clientId[0] == '\0') {
                 String mac = WiFi.macAddress();
@@ -4491,12 +4560,17 @@ static bool mqttValidTopicChars(const char* t, bool allowWildcards, bool filter)
     }
     return true;
 }
+
+// -----------------------------------------------------------------------------
+//  Raw packet TX
+// -----------------------------------------------------------------------------
 static bool mqttRawSend(const uint8_t* data, size_t len) {
     if (!mqttNet || !mqttNet->connected()) return false;
     size_t sent = 0;
     while (sent < len) {
         size_t n = mqttNet->write(data + sent, len - sent);
         if (n == 0) {
+            // socket buffer full — give the TCP stack a moment
             delay(1);
             yield();
             n = mqttNet->write(data + sent, len - sent);
@@ -4508,6 +4582,8 @@ static bool mqttRawSend(const uint8_t* data, size_t len) {
     mqttSt.txCount += (uint32_t)len;
     return true;
 }
+
+// Build packet: fixed header type/flags + remaining length + variable header+payload already in txBuf
 static bool mqttSendPacket(uint8_t typeFlags, const uint8_t* var, uint32_t varlen) {
     if (!mqttTxBuf) return false;
     if (varlen > mqttTxCap - 5) return false;
@@ -4517,11 +4593,13 @@ static bool mqttSendPacket(uint8_t typeFlags, const uint8_t* var, uint32_t varle
     if (varlen && var) memcpy(mqttTxBuf + 1 + n, var, varlen);
     return mqttRawSend(mqttTxBuf, 1 + n + varlen);
 }
+
 static bool mqttSendConnect() {
-    uint8_t* v = mqttTxBuf + 5; 
+    uint8_t* v = mqttTxBuf + 5; // max fixed header 5 bytes
     uint8_t* p = v;
     size_t room = mqttTxCap - 5;
     size_t w;
+    // Protocol Name + Level
     if (mqttCfg.protocol31) {
         w = mqttPutStr(p, room, "MQIsdp");
         if (!w) return false;
@@ -4533,6 +4611,7 @@ static bool mqttSendConnect() {
         p += w; room -= w;
         *p++ = 4; room--;
     }
+    // Connect flags: user(7) pass(6) willRetain(5) willQoS(4:3) will(2) clean(1) reserved(0)
     uint8_t flags = 0;
     bool hasUser = mqttCfg.user[0] != '\0';
     bool hasPass = mqttCfg.pass[0] != '\0';
@@ -4547,8 +4626,10 @@ static bool mqttSendConnect() {
     if (mqttCfg.cleanSession) flags |= 0x02;
     if (room < 3) return false;
     *p++ = flags;
+    // Keepalive
     p += mqttPutU16(p, mqttCfg.keepalive);
     room -= 3;
+    // Payload: client id
     char cid[48];
     if (mqttCfg.autoClientId || mqttCfg.clientId[0] == '\0') {
         String mac = WiFi.macAddress();
@@ -4591,6 +4672,7 @@ static bool mqttSendConnect() {
     memmove(mqttTxBuf + 1 + n, v, varlen);
     return mqttRawSend(mqttTxBuf, 1 + n + varlen);
 }
+
 static bool mqttSendPublish(const char* topic, const uint8_t* payload, uint16_t plen,
                             uint8_t qos, bool retain, bool dup, uint16_t pid) {
     uint8_t* v = mqttTxBuf + 5;
@@ -4609,11 +4691,13 @@ static bool mqttSendPublish(const char* topic, const uint8_t* payload, uint16_t 
     if (ok) mqttSt.pubOut++;
     return ok;
 }
+
 static bool mqttSendPidOnly(uint8_t typeFlags, uint16_t pid) {
     uint8_t v[2];
     mqttPutU16(v, pid);
     return mqttSendPacket(typeFlags, v, 2);
 }
+
 static bool mqttSendSubscribe(const char* filter, uint8_t qos, uint16_t pid) {
     uint8_t* v = mqttTxBuf + 5;
     uint8_t* p = v;
@@ -4631,6 +4715,7 @@ static bool mqttSendSubscribe(const char* filter, uint8_t qos, uint16_t pid) {
     memmove(mqttTxBuf + 1 + n, v, varlen);
     return mqttRawSend(mqttTxBuf, 1 + n + varlen);
 }
+
 static bool mqttSendUnsubscribe(const char* filter, uint16_t pid) {
     uint8_t* v = mqttTxBuf + 5;
     uint8_t* p = v;
@@ -4647,6 +4732,7 @@ static bool mqttSendUnsubscribe(const char* filter, uint16_t pid) {
     memmove(mqttTxBuf + 1 + n, v, varlen);
     return mqttRawSend(mqttTxBuf, 1 + n + varlen);
 }
+
 static bool mqttSendPing() {
     if (mqttSendPacket(0xC0, nullptr, 0)) {
         mqttLastOut = millis();
@@ -4654,9 +4740,14 @@ static bool mqttSendPing() {
     }
     return false;
 }
+
 static bool mqttSendDisconnect() {
     return mqttSendPacket(0xE0, nullptr, 0);
 }
+
+// -----------------------------------------------------------------------------
+//  Inflight tracking
+// -----------------------------------------------------------------------------
 static MqttOut* mqttInflightAdd(uint16_t id, uint8_t kind, const char* topic,
                                 const uint8_t* payload, uint16_t plen, bool retain) {
     for (int i = 0; i < MQTT_MAX_INFLIGHT; i++) {
@@ -4679,14 +4770,17 @@ static MqttOut* mqttInflightAdd(uint16_t id, uint8_t kind, const char* topic,
     }
     return nullptr;
 }
+
 static void mqttInflightRemove(uint16_t id) {
     for (int i = 0; i < MQTT_MAX_INFLIGHT; i++) {
         if (mqttOut[i].active && mqttOut[i].id == id) mqttOut[i].active = false;
     }
 }
+
 static void mqttInflightClear() {
     for (int i = 0; i < MQTT_MAX_INFLIGHT; i++) mqttOut[i].active = false;
 }
+
 static void mqttRetryInflight() {
     unsigned long now = millis();
     for (int i = 0; i < MQTT_MAX_INFLIGHT; i++) {
@@ -4695,6 +4789,8 @@ static void mqttRetryInflight() {
         if (now - o.sentAt < 5000UL) continue;
         o.sentAt = now;
         if (o.kind <= 1 && !o.retryable) {
+            // cannot safely retransmit a truncated payload: drop tracking,
+            // the QoS handshake may still complete if the original arrived
             o.active = false;
             mqttInfo("oversized QoS msg dropped (no retry)");
             continue;
@@ -4708,12 +4804,14 @@ static void mqttRetryInflight() {
         }
     }
 }
+
 static bool mqttInqSeen(uint16_t id) {
     for (int i = 0; i < MQTT_MAX_INQ; i++) {
         if (mqttInq[i].used && mqttInq[i].id == id) return true;
     }
     return false;
 }
+
 static void mqttInqAdd(uint16_t id) {
     int freeSlot = -1;
     unsigned long oldestT = 0;
@@ -4727,11 +4825,16 @@ static void mqttInqAdd(uint16_t id) {
     mqttInq[freeSlot].id = id;
     mqttInq[freeSlot].t = millis();
 }
+
 static void mqttInqRemove(uint16_t id) {
     for (int i = 0; i < MQTT_MAX_INQ; i++) {
         if (mqttInq[i].used && mqttInq[i].id == id) mqttInq[i].used = false;
     }
 }
+
+// -----------------------------------------------------------------------------
+//  Command engine — words, relay exec, payload parsing
+// -----------------------------------------------------------------------------
 #define MQTT_WORD_UNKNOWN  0
 #define MQTT_WORD_ON       1
 #define MQTT_WORD_OFF      2
@@ -4741,6 +4844,7 @@ static void mqttInqRemove(uint16_t id) {
 #define MQTT_WORD_MANUAL   6
 #define MQTT_WORD_RESTART  7
 #define MQTT_WORD_SYNC     8
+
 static bool mqttWordEq(const char* a, const char* b) {
     if (!a || !b) return false;
     while (*a && *b) {
@@ -4749,6 +4853,7 @@ static bool mqttWordEq(const char* a, const char* b) {
     }
     return *a == '\0' && *b == '\0';
 }
+
 static int mqttParseWord(const char* p) {
     if (!p) return MQTT_WORD_UNKNOWN;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
@@ -4757,6 +4862,7 @@ static int mqttParseWord(const char* p) {
     while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && n < sizeof(buf) - 1) buf[n++] = *p++;
     buf[n] = '\0';
     if (buf[0] == '\0') return MQTT_WORD_UNKNOWN;
+    // custom payloads first (never match empty strings)
     if (mqttCfg.onPayload[0] && mqttWordEq(buf, mqttCfg.onPayload)) return MQTT_WORD_ON;
     if (mqttCfg.offPayload[0] && mqttWordEq(buf, mqttCfg.offPayload)) return MQTT_WORD_OFF;
     if (mqttCfg.togPayload[0] && mqttWordEq(buf, mqttCfg.togPayload)) return MQTT_WORD_TOGGLE;
@@ -4775,6 +4881,8 @@ static int mqttParseWord(const char* p) {
     if (mqttWordEq(buf, "sync") || mqttWordEq(buf, "time")) return MQTT_WORD_SYNC;
     return MQTT_WORD_UNKNOWN;
 }
+
+// Extract relay number from topic ".../relay/<n>/..." or ".../r/<n>/..."; -1 if none
 static int mqttRelayFromTopic(const char* topic) {
     if (!topic) return -1;
     const char* p = topic;
@@ -4796,6 +4904,7 @@ static int mqttRelayFromTopic(const char* topic) {
     }
     return -1;
 }
+
 static void mqttExecRelay(int relay, int word, const char* src) {
     if (relay < 0 || relay >= gpioConfig.count) {
         mqttErr("invalid relay index");
@@ -4830,6 +4939,7 @@ static void mqttExecRelay(int relay, int word, const char* src) {
     } else {
         return;
     }
+    // immediate feedback
     if (mqttCfg.ackEnable) {
         char pl[96];
         snprintf(pl, sizeof(pl), "{\"ok\":true,\"relay\":%d,\"state\":\"%s\",\"src\":\"%s\"}",
@@ -4840,6 +4950,7 @@ static void mqttExecRelay(int relay, int word, const char* src) {
     }
     mqttPublishAllStates(true);
 }
+
 static void mqttExecAll(int word) {
     if (word != MQTT_WORD_ON && word != MQTT_WORD_OFF && word != MQTT_WORD_TOGGLE) return;
     for (int i = 0; i < gpioConfig.count; i++) {
@@ -4856,6 +4967,7 @@ static void mqttExecAll(int word) {
     saveConfiguration();
     mqttPublishAllStates(true);
 }
+
 static void mqttExecWord(int relay, int word, const char* src, bool allowAll = false) {
     switch (word) {
         case MQTT_WORD_ON:
@@ -4893,11 +5005,13 @@ static void mqttExecWord(int relay, int word, const char* src, bool allowAll = f
             break;
     }
 }
+
 static void mqttExecuteAction(uint8_t action, int relay, const char* payload, uint16_t plen, const char* src) {
     char wordBuf[48];
     uint16_t n = plen < sizeof(wordBuf) - 1 ? plen : (uint16_t)(sizeof(wordBuf) - 1);
     memcpy(wordBuf, payload, n);
     wordBuf[n] = '\0';
+
     switch (action) {
         case MQTT_ACT_LOG:
             mqttLogMsg('<', src ? src : "rule", wordBuf);
@@ -4932,9 +5046,12 @@ static void mqttExecuteAction(uint8_t action, int relay, const char* payload, ui
         case MQTT_ACT_TIMESYNC: tryNTPSync(); break;
         default: break;
     }
-    (void)mqttWordEq; 
+    (void)mqttWordEq; // silence unused when optimized
 }
+
+// Parse JSON or plain payload and execute against relay (-2 = all/unknown)
 static void mqttProcessCommand(const char* topic, const char* payload, uint16_t plen, const char* src) {
+    // JSON?
     char buf[256];
     uint16_t n = plen < sizeof(buf) - 1 ? plen : (uint16_t)(sizeof(buf) - 1);
     memcpy(buf, payload, n);
@@ -4948,8 +5065,8 @@ static void mqttProcessCommand(const char* topic, const char* payload, uint16_t 
             bool relaySet = false;
             if (doc.containsKey("relay")) {
                 if (doc["relay"].is<int>()) {
-                    relay = doc["relay"].as<int>() - 1; 
-                    if (doc["relay"].as<int>() == 0) relay = -1; 
+                    relay = doc["relay"].as<int>() - 1; // 1-based in API
+                    if (doc["relay"].as<int>() == 0) relay = -1; // explicit 0 = all
                     relaySet = true;
                 } else if (doc["relay"].is<const char*>()) {
                     const char* r = doc["relay"];
@@ -4959,6 +5076,7 @@ static void mqttProcessCommand(const char* topic, const char* payload, uint16_t 
                 int fromTopic = mqttRelayFromTopic(topic);
                 if (fromTopic >= 0) { relay = fromTopic - 1; relaySet = true; }
             }
+
             if (doc.containsKey("all")) {
                 int w = MQTT_WORD_UNKNOWN;
                 if (doc["all"].is<bool>()) w = doc["all"].as<bool>() ? MQTT_WORD_ON : MQTT_WORD_OFF;
@@ -4979,6 +5097,7 @@ static void mqttProcessCommand(const char* topic, const char* payload, uint16_t 
                 const char* c = doc["cmd"];
                 int w = mqttParseWord(c);
                 if (w == MQTT_WORD_UNKNOWN && mqttWordEq(c, "set")) {
+                    // "set" without state is a no-op; state handled above
                 } else {
                     mqttExecWord(relaySet ? relay : -1, w, src, true);
                 }
@@ -5006,6 +5125,7 @@ static void mqttProcessCommand(const char* topic, const char* payload, uint16_t 
             }
             return;
         }
+        // fall through to plain parsing on JSON error
     }
     int w = mqttParseWord(buf);
     if (w == MQTT_WORD_UNKNOWN) {
@@ -5013,10 +5133,14 @@ static void mqttProcessCommand(const char* topic, const char* payload, uint16_t 
         return;
     }
     int relay = mqttRelayFromTopic(topic);
-    if (relay > 0) relay = relay - 1; 
+    if (relay > 0) relay = relay - 1; // topics are 1-based
     else relay = -1;
     mqttExecWord(relay, w, src, true);
 }
+
+// -----------------------------------------------------------------------------
+//  Public publish API
+// -----------------------------------------------------------------------------
 bool mqttPublish(const char* topic, const uint8_t* payload, uint16_t plen, uint8_t qos, bool retain) {
     if (mqttState != MQTT_ST_CONNECTED || !topic || topic[0] == '\0') return false;
     if (qos == 0) {
@@ -5037,6 +5161,7 @@ bool mqttPublish(const char* topic, const uint8_t* payload, uint16_t plen, uint8
         return false;
     }
     if (!o) {
+        // no tracking slot — message was sent (at least once) but cannot be retried
         mqttInfo("inflight full: sent without retry tracking");
     }
     mqttLogMsg('>', topic, (const char*)payload);
@@ -5044,6 +5169,7 @@ bool mqttPublish(const char* topic, const uint8_t* payload, uint16_t plen, uint8
     mqttSetStr(mqttSt.lastPayload, sizeof(mqttSt.lastPayload), (const char*)payload);
     return true;
 }
+
 static void mqttPublishRelayState(uint8_t i) {
     if (mqttState != MQTT_ST_CONNECTED || i >= gpioConfig.count) return;
     char t[128];
@@ -5055,6 +5181,7 @@ static void mqttPublishRelayState(uint8_t i) {
     if (mqttCfg.jsonState) {
         char name[20];
         mqttSetStr(name, sizeof(name), relayConfigs[i].name);
+        // escape quotes in name minimally
         for (int k = 0; name[k]; k++) if (name[k] == '"' || name[k] == '\\') name[k] = '\'';
         snprintf(pl, sizeof(pl), "{\"state\":\"%s\",\"manual\":%s,\"name\":\"%s\",\"ch\":%u}",
                  lastRelayOutputs[i] ? mqttCfg.onPayload : mqttCfg.offPayload,
@@ -5065,6 +5192,7 @@ static void mqttPublishRelayState(uint8_t i) {
     }
     mqttPublish(t, (const uint8_t*)pl, (uint16_t)strlen(pl), mqttCfg.pubQos, mqttCfg.pubRetain);
 }
+
 void mqttPublishAllStates(bool force) {
     if (mqttState != MQTT_ST_CONNECTED) return;
     bool changed = false;
@@ -5082,6 +5210,7 @@ void mqttPublishAllStates(bool force) {
     }
     mqttSnapValid = true;
     if (force || changed) {
+        // combined JSON state
         char t[96];
         mqttResolveTopic(mqttCfg.stateTopic[0] ? mqttCfg.stateTopic : "%b/state", t, sizeof(t));
         if (t[0]) {
@@ -5100,6 +5229,7 @@ void mqttPublishAllStates(bool force) {
         }
     }
 }
+
 static void mqttPublishTelemetry() {
     char t[96];
     mqttResolveTopic(mqttCfg.teleTopic[0] ? mqttCfg.teleTopic : "%b/telemetry", t, sizeof(t));
@@ -5127,6 +5257,7 @@ static void mqttPublishTelemetry() {
     mqttPublish(t, (const uint8_t*)pl, (uint16_t)strlen(pl), mqttCfg.pubQos, false);
     mqttLastTele = millis();
 }
+
 static void mqttPublishAvailability(bool online) {
     char t[96];
     mqttResolveTopic(mqttCfg.availTopic[0] ? mqttCfg.availTopic : "%b/availability", t, sizeof(t));
@@ -5137,6 +5268,7 @@ static void mqttPublishAvailability(bool online) {
     mqttPublish(t, (const uint8_t*)pl, (uint16_t)strlen(pl),
                 mqttCfg.birthQos, online ? mqttCfg.birthRetain : mqttCfg.lwtRetain);
 }
+
 static void mqttPublishDiscovery() {
     if (!mqttCfg.haEnabled) return;
     const char* comp = "switch";
@@ -5182,6 +5314,10 @@ static void mqttPublishDiscovery() {
         mqttPublish(t, (const uint8_t*)pl, (uint16_t)strlen(pl), 0, true);
     }
 }
+
+// -----------------------------------------------------------------------------
+//  Inbound packet processing
+// -----------------------------------------------------------------------------
 static void mqttDeliver(const char* topic, const uint8_t* payload, uint16_t plen, uint8_t qos, bool retain) {
     (void)qos; (void)retain;
     char pl[64];
@@ -5192,6 +5328,8 @@ static void mqttDeliver(const char* topic, const uint8_t* payload, uint16_t plen
     mqttSt.pubIn++;
     mqttSetStr(mqttSt.lastTopic, sizeof(mqttSt.lastTopic), topic);
     mqttSetStr(mqttSt.lastPayload, sizeof(mqttSt.lastPayload), pl);
+
+    // 1) generic rules first
     bool ruleMatched = false;
     for (int r = 0; r < MAX_MQTT_RULES; r++) {
         if (!mqttCfg.rules[r].enabled) continue;
@@ -5210,11 +5348,14 @@ static void mqttDeliver(const char* topic, const uint8_t* payload, uint16_t plen
             mqttExecuteAction(mqttCfg.rules[r].action, relay, (const char*)payload, plen, topic);
         }
     }
+    // 2) built-in command topics (skipped when a user rule already handled the topic)
     if (ruleMatched || !mqttCfg.cmdEnable) return;
+
     char base[96];
     mqttResolvedBase(base, sizeof(base));
     char cmdT[96];
     mqttResolveTopic(mqttCfg.cmdTopic[0] ? mqttCfg.cmdTopic : "%b/cmd", cmdT, sizeof(cmdT));
+
     bool isCmd = cmdT[0] && mqttTopicMatch(cmdT, topic);
     char filterRelay[112];
     snprintf(filterRelay, sizeof(filterRelay), "%s/relay/+", cmdT[0] ? cmdT : "");
@@ -5233,12 +5374,13 @@ static void mqttDeliver(const char* topic, const uint8_t* payload, uint16_t plen
         mqttProcessCommand(topic, (const char*)payload, plen, "mqtt");
     }
 }
+
 static void mqttProcessPacket(uint8_t hdr, const uint8_t* v, uint32_t len) {
     mqttLastIn = millis();
     mqttSt.rxCount += len;
     uint8_t type = (uint8_t)(hdr >> 4);
     switch (type) {
-        case 2: { 
+        case 2: { // CONNACK
             if (!mqttAwaitingConnack) break;
             mqttAwaitingConnack = false;
             if (len < 2) { mqttErr("bad CONNACK"); break; }
@@ -5250,6 +5392,7 @@ static void mqttProcessPacket(uint8_t hdr, const uint8_t* v, uint32_t len) {
                 mqttLastIn = mqttLastOut = millis();
                 mqttBackoffMs = 0;
                 mqttSnapValid = false;
+                // subscribe
                 char cmdT[96];
                 mqttResolveTopic(mqttCfg.cmdTopic[0] ? mqttCfg.cmdTopic : "%b/cmd", cmdT, sizeof(cmdT));
                 char base[96];
@@ -5272,6 +5415,7 @@ static void mqttProcessPacket(uint8_t hdr, const uint8_t* v, uint32_t len) {
                     mqttResolveTopic(mqttCfg.rules[r].topic, filter, sizeof(filter));
                     if (filter[0]) mqttSendSubscribe(filter, mqttCfg.rules[r].qos, mqttAllocPid());
                 }
+                // birth + availability + state + discovery
                 if (mqttCfg.birthEnabled) {
                     char t[96];
                     mqttResolveTopic(mqttCfg.birthTopic[0] ? mqttCfg.birthTopic : "%b/availability", t, sizeof(t));
@@ -5301,14 +5445,14 @@ static void mqttProcessPacket(uint8_t hdr, const uint8_t* v, uint32_t len) {
             }
             break;
         }
-        case 3: { 
+        case 3: { // PUBLISH
             bool retain = (hdr & 0x01) != 0;
             uint8_t qos = (uint8_t)((hdr >> 1) & 0x03);
             if (qos > 2) { mqttErr("bad PUBLISH qos"); break; }
             if (len < 2) break;
             uint16_t tlen = mqttGetU16(v);
             if (len < (uint32_t)(2 + tlen)) break;
-            if (tlen == 0) { mqttErr("PUBLISH with empty topic"); break; } 
+            if (tlen == 0) { mqttErr("PUBLISH with empty topic"); break; } // spec 3.3.2.1
             char topic[128];
             uint16_t copyLen = tlen < sizeof(topic) - 1 ? tlen : (uint16_t)(sizeof(topic) - 1);
             memcpy(topic, v + 2, copyLen);
@@ -5325,21 +5469,22 @@ static void mqttProcessPacket(uint8_t hdr, const uint8_t* v, uint32_t len) {
 
             if (qos == 2) {
                 if (mqttInqSeen(pid)) {
-                    mqttSendPidOnly(0x50, pid); 
+                    // duplicate PUBLISH: re-ack, do not re-deliver
+                    mqttSendPidOnly(0x50, pid); // PUBREC
                     break;
                 }
                 mqttInqAdd(pid);
             }
             mqttDeliver(topic, payload, plen, qos, retain);
-            if (qos == 1) mqttSendPidOnly(0x40, pid); 
-            if (qos == 2) mqttSendPidOnly(0x50, pid); 
+            if (qos == 1) mqttSendPidOnly(0x40, pid); // PUBACK
+            if (qos == 2) mqttSendPidOnly(0x50, pid); // PUBREC
             break;
         }
-        case 4: 
-        case 7: 
+        case 4: // PUBACK (QoS 1 complete)
+        case 7: // PUBCOMP (QoS 2 complete)
             if (len >= 2) mqttInflightRemove(mqttGetU16(v));
             break;
-        case 5: 
+        case 5: // PUBREC
             if (len >= 2) {
                 uint16_t id = mqttGetU16(v);
                 for (int i = 0; i < MQTT_MAX_INFLIGHT; i++) {
@@ -5349,21 +5494,21 @@ static void mqttProcessPacket(uint8_t hdr, const uint8_t* v, uint32_t len) {
                         break;
                     }
                 }
-                mqttSendPidOnly(0x62, id); 
+                mqttSendPidOnly(0x62, id); // PUBREL
             }
             break;
-        case 6: 
+        case 6: // PUBREL (QoS 2 phase 2)
             if (len >= 2) {
                 uint16_t id = mqttGetU16(v);
                 mqttInqRemove(id);
-                mqttSendPidOnly(0x70, id); 
+                mqttSendPidOnly(0x70, id); // PUBCOMP
             }
             break;
-        case 9:  
-        case 11: 
-        case 13: 
+        case 9:  // SUBACK
+        case 11: // UNSUBACK
+        case 13: // PINGRESP
             break;
-        case 14: 
+        case 14: // DISCONNECT (broker-initiated)
             mqttErr("broker sent DISCONNECT");
             mqttState = MQTT_ST_WAIT;
             if (mqttNet) mqttNet->stop();
@@ -5373,14 +5518,15 @@ static void mqttProcessPacket(uint8_t hdr, const uint8_t* v, uint32_t len) {
             break;
     }
 }
+
 static void mqttParseRx() {
     size_t off = 0;
     while (mqttRxLen - off >= 2) {
         uint8_t used = 0;
         uint32_t rem = mqttDecodeVarInt(mqttRxBuf + off + 1, mqttRxLen - off - 1, &used);
-        if (used == 0 || rem == 0xFFFFFFFFu) break; 
+        if (used == 0 || rem == 0xFFFFFFFFu) break; // incomplete
         if (rem + 5 > mqttRxCap) { mqttErr("packet too large"); mqttStop(false); mqttScheduleRetry(); return; }
-        if (mqttRxLen - off < (size_t)(1 + used + rem)) break; 
+        if (mqttRxLen - off < (size_t)(1 + used + rem)) break; // incomplete
         mqttProcessPacket(mqttRxBuf[off], mqttRxBuf + off + 1 + used, rem);
         if (mqttState != MQTT_ST_CONNECTED && mqttState != MQTT_ST_CONNACK) return;
         off += 1 + used + rem;
@@ -5417,12 +5563,17 @@ static void mqttReadPump() {
         if (mqttState != MQTT_ST_CONNECTED && mqttState != MQTT_ST_CONNACK) return;
     }
 }
+
+// -----------------------------------------------------------------------------
+//  Connection management
+// -----------------------------------------------------------------------------
 static void mqttScheduleRetry() {
     unsigned long now = millis();
     if (mqttBackoffMs == 0) mqttBackoffMs = (unsigned long)mqttCfg.reconnectMin * 1000UL;
     if (mqttBackoffMs < 500UL) mqttBackoffMs = 500UL;
     unsigned long maxB = (unsigned long)mqttCfg.reconnectMax * 1000UL;
     if (maxB < mqttBackoffMs) maxB = mqttBackoffMs;
+    // ±25% jitter
     unsigned long jitter = (unsigned long)random((long)(mqttBackoffMs / 2 + 1));
     unsigned long delayMs = mqttBackoffMs / 2 + jitter;
     mqttNextAttemptAt = now + delayMs;
@@ -5430,14 +5581,17 @@ static void mqttScheduleRetry() {
     if (mqttBackoffMs > maxB) mqttBackoffMs = maxB;
     mqttState = MQTT_ST_WAIT;
 }
+
 static bool mqttNetworkUp() {
     if (WiFi.status() == WL_CONNECTED) return true;
     if (WiFi.softAPgetStationNum() > 0) return true;
     return false;
 }
+
 void mqttStop(bool graceful) {
     if (mqttNet) {
         if (graceful && (mqttState == MQTT_ST_CONNECTED || mqttState == MQTT_ST_CONNACK)) {
+            // best-effort: announce offline + DISCONNECT (prevents LWT firing)
             mqttPublishAvailability(false);
             mqttSendDisconnect();
         }
@@ -5449,6 +5603,7 @@ void mqttStop(bool graceful) {
     mqttRxLen = 0;
     mqttSnapValid = false;
 }
+
 void mqttForceReconnect() {
     mqttStop(true);
     if (mqttCfg.enabled) {
@@ -5457,6 +5612,7 @@ void mqttForceReconnect() {
         mqttNextAttemptAt = millis();
     }
 }
+
 static void mqttAttempt() {
     if (!mqttTxBuf || !mqttRxBuf) return;
     if (mqttCfg.host[0] == '\0') {
@@ -5465,15 +5621,18 @@ static void mqttAttempt() {
         return;
     }
     mqttState = MQTT_ST_WAIT;
+    // free previous client
     mqttTcp.stop();
     mqttSsl.stop();
+
     if (mqttCfg.tlsMode != MQTT_TLS_OFF) {
         mqttSsl.setHandshakeTimeout(mqttCfg.connectTimeout);
         if (mqttCfg.tlsMode == MQTT_TLS_INSECURE) {
             mqttSsl.setInsecure();
         } else if (mqttCfg.tlsMode == MQTT_TLS_FINGERPRINT) {
-            if (mqttCfg.tlsFp[0]) mqttSsl.setFingerprint(mqttCfg.tlsFp);
-            else mqttSsl.setInsecure();
+            // core 2.x: chain check skipped at handshake; the SHA-256 pin is
+            // enforced right after connect via WiFiClientSecure::verify().
+            mqttSsl.setInsecure();
         } else if (mqttCfg.tlsMode == MQTT_TLS_CA || mqttCfg.tlsMode == MQTT_TLS_CA_CLIENT) {
             if (mqttCaCert.length()) mqttSsl.setCACert(mqttCaCert.c_str());
             else mqttSsl.setInsecure();
@@ -5497,6 +5656,14 @@ static void mqttAttempt() {
         mqttScheduleRetry();
         return;
     }
+    if (mqttCfg.tlsMode == MQTT_TLS_FINGERPRINT && mqttCfg.tlsFp[0] &&
+        !mqttSsl.verify(mqttCfg.tlsFp, nullptr)) {
+        mqttErr("TLS fingerprint mismatch");
+        mqttNet->stop();
+        mqttNet = nullptr;
+        mqttScheduleRetry();
+        return;
+    }
     if (!mqttSendConnect()) {
         mqttErr("CONNECT send failed");
         mqttNet->stop();
@@ -5509,12 +5676,14 @@ static void mqttAttempt() {
     mqttConnackDeadline = millis() + (unsigned long)mqttCfg.connectTimeout * 1000UL;
     mqttRxLen = 0;
 }
+
 void mqttLoop() {
     if (!mqttCfg.enabled) {
         if (mqttState != MQTT_ST_OFF) mqttStop(true);
         return;
     }
     unsigned long now = millis();
+
     if (mqttState == MQTT_ST_CONNECTED || mqttState == MQTT_ST_CONNACK) {
         mqttReadPump();
     }
@@ -5525,6 +5694,7 @@ void mqttLoop() {
         return;
     }
     if (mqttState == MQTT_ST_CONNECTED) {
+        // keepalive
         if (mqttCfg.keepalive > 0) {
             unsigned long ka = (unsigned long)mqttCfg.keepalive * 1000UL;
             if (now - mqttLastOut >= (ka > 500 ? ka - 500 : ka / 2)) {
@@ -5538,6 +5708,7 @@ void mqttLoop() {
             }
         }
         mqttRetryInflight();
+        // publish changed states
         if (mqttCfg.pubOnChange) {
             for (int i = 0; i < gpioConfig.count && i < MAX_RELAYS; i++) {
                 if (!mqttSnapValid || mqttSnapState[i] != lastRelayOutputs[i] ||
@@ -5547,11 +5718,14 @@ void mqttLoop() {
                 }
             }
         }
+        // periodic telemetry
         if (mqttCfg.teleInterval > 0 && now - mqttLastTele >= (unsigned long)mqttCfg.teleInterval * 1000UL) {
             mqttPublishTelemetry();
         }
         return;
     }
+
+    // (re)connect attempts
     if (mqttState == MQTT_ST_CONNECTING) {
         mqttScheduleRetry();
         return;
@@ -5566,6 +5740,10 @@ void mqttLoop() {
         mqttState = MQTT_ST_WAIT;
     }
 }
+
+// -----------------------------------------------------------------------------
+//  Config: defaults / load / save
+// -----------------------------------------------------------------------------
 static void mqttDefaults() {
     memset(&mqttCfg, 0, sizeof(MqttConfig));
     mqttCfg.magic = MQTT_CFG_MAGIC;
@@ -5619,6 +5797,7 @@ static void mqttDefaults() {
         mqttCfg.rules[i].relay = -1;
     }
 }
+
 void mqttLoadConfig() {
     preferences.begin(NVS_NAMESPACE, true);
     size_t len = preferences.getBytes("mqttConfig", &mqttCfg, sizeof(MqttConfig));
@@ -5630,6 +5809,7 @@ void mqttLoadConfig() {
     if (!valid) {
         mqttDefaults();
     }
+    // sanitize
     if (mqttCfg.port == 0) mqttCfg.port = 1883;
     if (mqttCfg.keepalive < 5) mqttCfg.keepalive = 5;
     if (mqttCfg.keepalive > 3600) mqttCfg.keepalive = 3600;
@@ -5649,6 +5829,7 @@ void mqttLoadConfig() {
     if (mqttCfg.togPayload[0] == '\0') mqttSetStr(mqttCfg.togPayload, sizeof(mqttCfg.togPayload), "TOGGLE");
     if (mqttCfg.baseTopic[0] == '\0') mqttSetStr(mqttCfg.baseTopic, sizeof(mqttCfg.baseTopic), "relay16/%id%");
 }
+
 void mqttSaveConfig() {
     preferences.begin(NVS_NAMESPACE, false);
     preferences.putBytes("mqttConfig", &mqttCfg, sizeof(MqttConfig));
@@ -5657,6 +5838,7 @@ void mqttSaveConfig() {
     preferences.putString("mqtt_key", mqttClientKey);
     preferences.end();
 }
+
 void mqttClearConfig() {
     mqttDefaults();
     mqttCaCert = "";
@@ -5664,10 +5846,13 @@ void mqttClearConfig() {
     mqttClientKey = "";
     mqttSaveConfig();
 }
+
 void mqttBegin() {
+    // close any lingering sockets from a previous session
     mqttTcp.stop();
     mqttSsl.stop();
     mqttNet = nullptr;
+    // allocate buffers
     if (mqttRxBuf) { free(mqttRxBuf); mqttRxBuf = nullptr; }
     if (mqttTxBuf) { free(mqttTxBuf); mqttTxBuf = nullptr; }
     size_t cap = mqttCfg.bufSize;
@@ -5689,6 +5874,8 @@ void mqttBegin() {
         mqttState = MQTT_ST_OFF;
     }
 }
+
+// NVS blob sanity: Preferences putBytes handles multi-KB blobs, stay conservative
 static_assert(sizeof(MqttConfig) < 3800, "MqttConfig NVS blob too large");
 
 // =============================================================================
@@ -5721,6 +5908,7 @@ static void mqttFillStatus(JsonObject st) {
     snprintf(broker, sizeof(broker), "%s:%u", mqttCfg.host, (unsigned)mqttCfg.port);
     st["broker"] = broker;
 }
+
 void handleGetMqtt() {
     DynamicJsonDocument doc(16384);
     JsonObject cfg = doc.createNestedObject("config");
@@ -5794,6 +5982,21 @@ void handleGetMqtt() {
     serializeJson(doc, resp);
     server.send(200, "application/json", resp);
 }
+
+// ---------------------------------------------------------------------------
+// TLS helpers
+// ---------------------------------------------------------------------------
+static bool mqttFpOk(const char *fp) {
+    int nib = 0;
+    for (const char *p = fp; *p; p++) {
+        if (*p == ':' || *p == ' ') continue;
+        char c = *p | 0x20;
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        if (++nib > 64) return false;
+    }
+    return nib == 64;
+}
+
 void handleSaveMqtt() {
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
@@ -5809,6 +6012,8 @@ void handleSaveMqtt() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Configuration too large\"}");
         return;
     }
+
+    // ---- validation ----
     bool willEnable = doc.containsKey("enabled") ? ((doc["enabled"] | 0) != 0) : (mqttCfg.enabled != 0);
     if (doc.containsKey("host")) {
         const char* h = doc["host"];
@@ -5896,6 +6101,16 @@ void handleSaveMqtt() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid TLS mode\"}");
         return;
     }
+    if (doc.containsKey("tlsFp")) {
+        const char *fp = doc["tlsFp"];
+        if (fp && fp[0] && !mqttFpOk(fp)) {
+            server.send(400, "application/json", "{\"success\":false,\"error\":\"TLS fingerprint must be 64 hex chars (SHA-256)\"}");
+            return;
+        }
+    }
+
+    // ---- apply fields ----
+    // gracefully close any live session first (old topics, prevents spurious LWT)
     mqttStop(true);
     if (doc.containsKey("enabled")) mqttCfg.enabled = (doc["enabled"] | 0) ? 1 : 0;
     if (doc.containsKey("host")) mqttSetStr(mqttCfg.host, sizeof(mqttCfg.host), doc["host"]);
@@ -6017,7 +6232,9 @@ void handleSaveMqtt() {
         if (doc.containsKey("clientCert")) mqttClientCert = String(crt);
         if (doc.containsKey("clientKey")) mqttClientKey = String(key);
     }
+
     mqttSaveConfig();
+    // reallocate buffers + reconnect with the new config
     mqttBegin();
     if (mqttCfg.enabled) {
         mqttForceReconnect();
@@ -6084,9 +6301,11 @@ void handleMqttPublish() {
     bool ok = mqttPublish(topic, (const uint8_t*)payload, (uint16_t)strlen(payload), (uint8_t)qos, retain);
     server.send(200, "application/json", ok ? "{\"success\":true}" : "{\"success\":false,\"error\":\"Publish failed\"}");
 }
+
 void handleMqttLog() {
     DynamicJsonDocument doc(10240);
     JsonArray arr = doc.createNestedArray("log");
+    // oldest to newest
     uint8_t start = (mqttLogCount < MQTT_LOG_LINES) ? 0 : mqttLogHead;
     for (uint8_t i = 0; i < mqttLogCount; i++) {
         const MqttLogEntry& e = mqttLog[(start + i) % MQTT_LOG_LINES];
