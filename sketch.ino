@@ -543,8 +543,8 @@ void handleGpioPage() {
   for (uint8_t i = 0; i < RELAY_COUNT; i++) {
     h += "<tr><td>"+String(i)+"</td><td>"+String(RELAY_PINS[i])+"</td>";
     h += "<td><select id='al"+String(i)+"' onchange=\"fetch('/api/gpio?act=active&i="+String(i)+"&v='+this.value)\">";
-    h += "<option value='0'"+(cfg.relays[i].activeLow?"":" selected")+">Active HIGH</option>";
-    h += "<option value='1'"+(cfg.relays[i].activeLow?" selected":"")+">Active LOW</option></select></td>";
+    h += String("<option value='0'") + (cfg.relays[i].activeLow ? "" : " selected") + ">Active HIGH</option>";
+    h += String("<option value='1'") + (cfg.relays[i].activeLow ? " selected" : "") + ">Active LOW</option></select></td>";
     h += "<td><button onclick=\"fetch('/api/gpio?act=sethigh&i="+String(i)+"')\">Force ON</button></td>";
     h += "<td><button class='off' onclick=\"fetch('/api/gpio?act=remove&i="+String(i)+"')\">Remove</button></td></tr>";
   }
@@ -563,7 +563,7 @@ void handleTimePage() {
   h += "NTP3 <input name='n3' value='"+String(cfg.ntpServers[2])+"'><br>";
   h += "Sync interval (s, up to 86400) <input name='iv' value='"+String(cfg.ntpSyncIntervalSec)+"'><br>";
   h += "GMT offset (s) <input name='off' value='"+String(cfg.gmtOffsetSec)+"'><br>";
-  h += "Auto TZ <input type='checkbox' name='atz'"+(cfg.autoTz?" checked":"")+"><br>";
+  h += String("Auto TZ <input type='checkbox' name='atz'") + (cfg.autoTz ? " checked" : "") + "><br>";
   h += "TZ rule <input name='tz' value='"+String(cfg.tzRule)+"'><br>";
   h += "<button type='button' onclick='saveTime()'>Save</button>";
   h += "<button type='button' onclick=\"fetch('/api/time?act=ntp')\">Sync NTP now</button>";
@@ -589,7 +589,7 @@ void handleApPage() {
   h += "Password <input name='pass' value='"+String(cfg.apPass)+"'><br>";
   h += "Channel (1..13) <input name='ch' value='"+String(cfg.apChannel)+"'><br>";
   h += "TX power (8..84, 0.25 dBm/step) <input name='tx' value='"+String(cfg.apTxPower)+"'><br>";
-  h += "Hidden <input type='checkbox' name='hid'"+(cfg.apHidden?" checked":"")+"><br>";
+  h += String("Hidden <input type='checkbox' name='hid'") + (cfg.apHidden ? " checked" : "") + "><br>";
   h += "<button type='button' onclick='saveAp()'>Save</button></form>";
   h += "<script>async function saveAp(){const f=new FormData(document.getElementById('f'));"
        "const r=await fetch('/api/ap',{method:'POST',body:new URLSearchParams(f)});"
@@ -605,7 +605,7 @@ void handleStaPage() {
   h += "<form id='f'>";
   h += "SSID <input name='ssid' value='"+String(cfg.staSsid)+"'><br>";
   h += "Password <input name='pass' value='"+String(cfg.staPass)+"'><br>";
-  h += "Enabled <input type='checkbox' name='en'"+(cfg.staEnabled?" checked":"")+"><br>";
+  h += String("Enabled <input type='checkbox' name='en'") + (cfg.staEnabled ? " checked" : "") + "><br>";
   h += "<button type='button' onclick='saveSta()'>Save</button></form>";
   h += "<script>async function saveSta(){const f=new FormData(document.getElementById('f'));"
        "await fetch('/api/sta',{method:'POST',body:new URLSearchParams(f)});alert('Saved');}</script>";
