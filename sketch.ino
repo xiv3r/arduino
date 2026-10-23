@@ -1,9 +1,3 @@
-/*
- * ============================================================================
- *  ESP32 Unified Relay Scheduler + Web Dashboard  (single-file sketch)
- * ============================================================================
- */
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -20,15 +14,14 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <esp_timer.h>
+#include <type_traits>
 #include "lwip/dns.h"
 #include "lwip/tcpip.h"
 #include "lwip/sockets.h"
 #include "lwip/ip_addr.h"
 
 #define FW_VERSION        "1.0.0"
-#define ASSET_VERSION     "1"
-
-#define LOGF(...) do {} while (0)
+#define ASSET_VERSION     "5"
 
 static const uint8_t NUM_RELAYS   = 16;
 static const uint8_t NUM_PAIRS    = 8;
@@ -108,6 +101,8 @@ struct GpioCfg {
 };
 
 enum TimeSrc : uint8_t { SRC_NONE = 0, SRC_RTC, SRC_NTP, SRC_BROWSER };
+struct TimeTIs32 {};
+struct TimeTIs64 {};
 
 struct Spec {
   uint64_t sec;
@@ -261,6 +256,11 @@ static uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t len) {
   return ~crc;
 }
 
+[[deprecated("This Arduino-ESP32 core has a 32-bit time_t: the clock cannot represent dates after 2038-01-19. Build with core 3.x for post-2038 operation.")]]
+static inline void checkTimeTWidth(TimeTIs32) {}
+static inline void checkTimeTWidth(TimeTIs64) {}
+static inline bool timeT64() { return sizeof(time_t) >= 8; }
+
 static const char* resetReasonStr() {
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON: return "Power-on";
@@ -340,7 +340,7 @@ static bool saveJsonAtomic(const char* path, JsonDocument& doc) {
 
   LittleFS.remove(tmp);
   File f = LittleFS.open(tmp, "w");
-  if (!f) { LOGF("[FS] open %s failed\n", tmp); return false; }
+  if (!f) { return false; }
   CrcFilePrint cp(f);
   size_t written = serializeJson(doc, cp);
   f.flush();
@@ -349,7 +349,6 @@ static bool saveJsonAtomic(const char* path, JsonDocument& doc) {
 
   uint32_t vcrc = 0; size_t vsize = 0;
   if (!fileCrc(tmp, vcrc, vsize) || vsize != written || vcrc != cp.crc()) {
-    LOGF("[FS] verify failed for %s\n", tmp);
     LittleFS.remove(tmp);
     return false;
   }
@@ -362,7 +361,6 @@ static bool saveJsonAtomic(const char* path, JsonDocument& doc) {
     LittleFS.remove(tmp);
     return false;
   }
-  LOGF("[FS] saved %s (%u bytes)\n", path, (unsigned)written);
   return true;
 }
 
@@ -372,7 +370,7 @@ static bool loadJsonFrom(const char* path, JsonDocument& doc) {
   if (f.size() == 0 || f.size() > 16384) { f.close(); return false; }
   DeserializationError e = deserializeJson(doc, f);
   f.close();
-  if (e) { LOGF("[FS] %s parse error: %s\n", path, e.c_str()); return false; }
+  if (e) { return false; }
   return doc.is<JsonObject>();
 }
 
@@ -387,12 +385,10 @@ static bool loadJsonAtomic(const char* path, JsonDocument& doc, bool* needsRewri
   if (loadJsonFrom(tmp, doc)) {
     LittleFS.remove(path);
     LittleFS.rename(tmp, path);
-    LOGF("[FS] recovered %s from .tmp\n", path);
     return true;
   }
   doc.clear();
   if (loadJsonFrom(bak, doc)) {
-    LOGF("[FS] recovered %s from .bak\n", path);
     if (needsRewrite) *needsRewrite = true;
     return true;
   }
@@ -722,14 +718,14 @@ static bool parseValue(const char*& p, const char* const* names, int nameCount, 
   return false;
 }
 
-static const char* parseField(const char* s, int lo, int hi, uint64_t& mask, const char* const* names, int nameCount, int nameBase) {
+static const char* parseField(const char* s, int lo, int hi, int stepMax, uint64_t& mask, const char* const* names, int nameCount, int nameBase) {
   mask = 0;
   const char* p = s;
   if (!*p) return "empty field";
   while (true) {
     int a, b, step = 1;
     bool star = false, range = false;
-    if (*p == '*') { p++; a = lo; b = hi; star = true; }
+    if (*p == '*') { p++; a = lo; b = stepMax; star = true; }
     else {
       if (!parseValue(p, names, nameCount, nameBase, a)) return "bad value";
       b = a;
@@ -738,7 +734,7 @@ static const char* parseField(const char* s, int lo, int hi, uint64_t& mask, con
     if (*p == '/') {
       p++;
       if (!parseValue(p, nullptr, 0, 0, step) || step < 1) return "bad step";
-      if (!star && !range) b = hi;
+      if (!star && !range) b = stepMax;
     }
     if (a < lo || a > hi || b < lo || b > hi) return "out of range";
     if (b < a) return "range reversed";
@@ -790,14 +786,14 @@ static const char* parseSpec(const char* str, Spec& sp) {
   for (int i = n; i < 7; i++) strcpy(tokens[i], "*");
 
   uint64_t m; const char* e;
-  if ((e = parseField(tokens[0], 0, 59, m, nullptr, 0, 0)))  { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[0], e); return specErr; } sp.sec = m;
-  if ((e = parseField(tokens[1], 0, 59, m, nullptr, 0, 0)))  { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[1], e); return specErr; } sp.min = m;
-  if ((e = parseField(tokens[2], 0, 23, m, nullptr, 0, 0)))  { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[2], e); return specErr; } sp.hour = (uint32_t)m;
-  if ((e = parseField(tokens[3], 0, 7, m, DOW_NAMES, 7, 0))) { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[3], e); return specErr; }
+  if ((e = parseField(tokens[0], 0, 59, 59, m, nullptr, 0, 0)))   { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[0], e); return specErr; } sp.sec = m;
+  if ((e = parseField(tokens[1], 0, 59, 59, m, nullptr, 0, 0)))   { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[1], e); return specErr; } sp.min = m;
+  if ((e = parseField(tokens[2], 0, 23, 23, m, nullptr, 0, 0)))   { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[2], e); return specErr; } sp.hour = (uint32_t)m;
+  if ((e = parseField(tokens[3], 0, 7, 6, m, DOW_NAMES, 7, 0)))   { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[3], e); return specErr; }
   if (m & (1ULL << 7)) m |= 1ULL;
   sp.dow = (uint8_t)(m & 0x7F);
-  if ((e = parseField(tokens[4], 1, 31, m, nullptr, 0, 0)))  { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[4], e); return specErr; } sp.dom = (uint32_t)m;
-  if ((e = parseField(tokens[5], 1, 12, m, MON_NAMES, 12, 1))){ snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[5], e); return specErr; } sp.mon = (uint16_t)m;
+  if ((e = parseField(tokens[4], 1, 31, 31, m, nullptr, 0, 0)))   { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[4], e); return specErr; } sp.dom = (uint32_t)m;
+  if ((e = parseField(tokens[5], 1, 12, 12, m, MON_NAMES, 12, 1))) { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[5], e); return specErr; } sp.mon = (uint16_t)m;
   if ((e = parseYearField(tokens[6], sp.y0, sp.y1)))         { snprintf(specErr, sizeof specErr, "%s: %s", FIELD_NAMES[6], e); return specErr; }
   sp.never = false;
   return nullptr;
@@ -1103,7 +1099,6 @@ static void applyTimezone() {
     strcopy(tzCurrent, sizeof tzCurrent, buf);
     setenv("TZ", tzCurrent, 1);
     tzset();
-    LOGF("[TZ] %s (%s)\n", tzCurrent, tzSource);
   }
   requestRecalcAll();
 }
@@ -1130,7 +1125,6 @@ static void setSystemTime(double epoch, TimeSrc src) {
   lastSetMs = millis();
   if (src != SRC_RTC) { rtcWritePending = true; rtcWriteReqMs = millis(); rtcCancelAlign(); }
   requestRecalcAll();
-  LOGF("[TIME] set from %s: %ld\n", SRC_NAMES[src], (long)tv.tv_sec);
 }
 
 static bool     rtcPresent = false;
@@ -1184,7 +1178,6 @@ static void rtcTick() {
       rtcDrift = 0;
       rtcSetCount++;
       rtcReadMs = millis();
-      LOGF("[RTC] written %ld\n", (long)tv.tv_sec);
     }
     return;
   }
@@ -1304,7 +1297,6 @@ static double nowDouble() { struct timeval tv; gettimeofday(&tv, nullptr); retur
 
 static void ntpFail(const char* why) {
   strcopy(ntpLastErr, sizeof ntpLastErr, why);
-  LOGF("[NTP] %s failed: %s\n", ntpServerCur, why);
   uint8_t n = ntpServerCount();
   ntpIdx = n ? (ntpIdx + 1) % n : 0;
   ntpCycleTries++;
@@ -1382,7 +1374,6 @@ static void ntpHandleReply() {
   ntpDueNow = false;
   ntpDueMs = millis() + (uint32_t)timeCfg.intervalMin * 60000UL;
   if (timeCfg.rotate) { uint8_t n = ntpServerCount(); if (n) ntpIdx = (ntpIdx + 1) % n; }
-  LOGF("[NTP] ok via %s offset=%.1fms rtt=%.1fms\n", ntpServerCur, offset * 1000.0, rtt * 1000.0);
 }
 
 static void ntpTick() {
@@ -1439,7 +1430,7 @@ static void tzClose() {
   tzState = TZ_IDLE; tzLastTryMs = millis(); tzTried = true;
 }
 
-static void tzFail(const char* why) { strcopy(tzLastResult, sizeof tzLastResult, why); LOGF("[TZ] fetch failed: %s\n", why); tzClose(); }
+static void tzFail(const char* why) { strcopy(tzLastResult, sizeof tzLastResult, why); tzClose(); }
 
 static void tzApplyResult(const char* name, long offset) {
   char posix[65] = "";
@@ -1617,7 +1608,6 @@ static void startAp() {
     dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
     dnsActive = dnsServer.start(53, "*", WiFi.softAPIP());
   }
-  LOGF("[AP] %s on %s ch%u\n", netCfg.ap.ssid, WiFi.softAPIP().toString().c_str(), netCfg.ap.channel);
 }
 
 static void stopAp() {
@@ -1625,7 +1615,6 @@ static void stopAp() {
   WiFi.softAPdisconnect(false);
   WiFi.enableAP(false);
   apActive = false;
-  LOGF("[AP] stopped\n");
 }
 
 static void staBegin() {
@@ -1642,7 +1631,6 @@ static void staBegin() {
   staConnecting = true;
   staAttemptMs = millis();
   staAttempts++;
-  LOGF("[STA] connecting to %s (attempt %lu)\n", netCfg.sta.ssid, (unsigned long)staAttempts);
 }
 
 static void staStop() {
@@ -1660,7 +1648,6 @@ static void onStaUp() {
   ntpTriggerNow();
   if (timeCfg.tzMode == 1) tzTriggerNow();
   startMdns();
-  LOGF("[STA] up: %s\n", WiFi.localIP().toString().c_str());
 }
 
 static void onStaDown(uint8_t reason) {
@@ -1673,7 +1660,6 @@ static void onStaDown(uint8_t reason) {
   if (ntpState != NTP_IDLE) { ntpAbort(); ntpDueNow = true; }
   if (tzState != TZ_IDLE) tzClose();
   if (wasUp) rtcRequestAlignSet();
-  LOGF("[STA] down (%u %s)\n", reason, wifiReasonStr(reason));
 }
 
 static void applyNetworkConfig() {
@@ -1756,7 +1742,6 @@ static void buttonTick() {
   if (down && !btnWasDown) { btnDownMs = millis(); btnFired = false; }
   if (down && !btnFired && elapsed(btnDownMs, FACTORY_HOLD_MS)) {
     btnFired = true;
-    LOGF("[BTN] factory reset\n");
     requestFactoryReset();
   }
   btnWasDown = down;
@@ -2058,7 +2043,7 @@ static void apiTimeTz() {
   char posix[65] = "";
   bool found = lookupPosixTz(iana, posix, sizeof posix);
   timeCfg.tzMode = 0;
-  if (found) { strcopy(timeCfg.posix, sizeof(timeCfg.posix), posix); }
+  if (found) { strcopy(timeCfg.posix, sizeof timeCfg.posix, posix); }
   else { timeCfg.posix[0] = 0; timeCfg.gmtOffset = off; timeCfg.dst = false; }
   markDirty(D_TIME);
   applyTimezone();
@@ -2314,6 +2299,7 @@ static void apiSystem() {
   d["dirty"] = dirtyMask != 0;
   d["recalcs"] = schedRecalcCount;
   d["serialDebug"] = false;
+  d["timeT64"] = timeT64();
   d["btn"] = buttonHeldMs();
   d["i2c"] = String("SDA ") + PIN_I2C_SDA + " / SCL " + PIN_I2C_SCL;
   JsonArray files = d["files"].to<JsonArray>();
@@ -2370,29 +2356,30 @@ static const char APP_CSS[] PROGMEM = R"CSS(
 a{color:var(--acc);text-decoration:none}
 header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:10px;padding:8px 12px;background:#0b1118;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .brand{font-weight:700;letter-spacing:.3px;white-space:nowrap}
-nav{display:flex;gap:4px;flex-wrap:wrap;flex:1}nav a{padding:6px 10px;border-radius:8px;color:var(--mut);font-size:14px}nav a.on{background:var(--acc);color:#fff}nav a:hover{color:#fff}
+nav{display:flex;gap:4px;flex-wrap:wrap;flex:1}nav a{display:inline-flex;align-items:center;min-height:36px;padding:4px 10px;border-radius:8px;color:var(--mut);font-size:14px;touch-action:manipulation}nav a.on{background:var(--acc);color:#fff}nav a:hover{color:#fff}
 .clock{margin-left:auto;text-align:right;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:15px;white-space:nowrap}
 .clock small{display:block;font-size:11px;color:var(--mut);font-family:inherit}.clock .bad{color:var(--bad)}.clock .ok{color:var(--tx)}
 main{padding:12px;max-width:1280px;margin:0 auto}
 h1{font-size:20px;margin:4px 0 12px}h2{font-size:16px;margin:0 0 10px;color:#c9d4e0}h3{font-size:14px;margin:12px 0 6px;color:var(--mut)}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(290px,1fr))}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
-.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:14px}.kv b{color:var(--mut);font-weight:500}.kv span{word-break:break-all}
-.btn{display:inline-block;background:var(--btn);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:14px;cursor:pointer;margin:2px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:14px}.kv b{color:var(--mut);font-weight:500}.kv span{overflow-wrap:anywhere;min-width:0}
+.btn{display:inline-block;background:var(--btn);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:14px;cursor:pointer;margin:2px;min-height:36px;touch-action:manipulation}
 .btn:hover{filter:brightness(1.15)}.btn:disabled{opacity:.5;cursor:default}.btn.p{background:var(--acc);border-color:var(--acc);color:#fff}.btn.g{background:var(--ok);border-color:var(--ok);color:#06240f}
-.btn.r{background:var(--bad);border-color:var(--bad);color:#fff}.btn.s{padding:4px 8px;font-size:12px}.btn.on{outline:2px solid #fff}
+.btn.r{background:var(--bad);border-color:var(--bad);color:#fff}.btn.s{padding:4px 8px;font-size:12px;min-height:30px}.btn.on{outline:2px solid #fff}.btn.ic{padding:2px 7px;font-size:14px;min-height:28px;line-height:1}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;background:#334155;color:#cbd5e1}
 .badge.on{background:var(--ok);color:#06240f}.badge.off{background:#475569;color:#e2e8f0}.badge.warn{background:var(--warn);color:#2a1a00}.badge.bad{background:var(--bad);color:#fff}.badge.ok{background:var(--ok);color:#06240f}
 label{display:block;font-size:13px;color:var(--mut);margin:8px 0 3px}
-input[type=text],input[type=password],input[type=number],select{width:100%;background:#0f1722;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:14px}
-input[type=checkbox]{width:18px;height:18px;vertical-align:middle}
+input[type=text],input[type=password],input[type=number],select{width:100%;background:#0f1722;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:14px;min-height:36px;touch-action:manipulation}
+input[type=checkbox]{width:18px;height:18px;vertical-align:middle;touch-action:manipulation}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}.row>*{flex:1;min-width:120px}.row>.fix{flex:0 0 auto;min-width:0}
 .chk{display:flex;align-items:center;gap:8px;margin:8px 0;font-size:14px;color:var(--tx)}
 table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{color:var(--mut);font-weight:600;font-size:12px}
-.sched{overflow-x:auto}.sched input{width:3.6em;padding:4px 5px;font-size:13px;text-align:center;font-family:ui-monospace,Menlo,Consolas,monospace}
-.sched input.y{width:5.2em}.sched td{white-space:nowrap}.sched .f{display:inline-flex;gap:3px}
+.sched{overflow-x:auto}.sched input[data-k]{width:calc(3ch + 16px);min-width:calc(3ch + 16px);min-height:30px;padding:4px 5px;font-size:13px;text-align:center;font-family:ui-monospace,Menlo,Consolas,monospace}
+.sched td{white-space:nowrap}.sched .f{display:inline-flex;gap:3px;flex-wrap:wrap}.fi{display:inline-flex;flex-direction:column;align-items:center}.fi small{font-size:10px;color:var(--mut);line-height:1.2}
+.sched td.lab::before{display:none;content:attr(data-l);color:var(--mut);font-size:11px;font-weight:600;margin-right:6px}
 .relay{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--card);margin-bottom:8px}
-.relay .nm{font-weight:700;font-size:16px;cursor:pointer;user-select:none;-webkit-user-select:none;min-width:120px}.relay .nm:hover{text-decoration:underline dotted}
+.relay .nm{font-weight:700;font-size:16px;cursor:pointer;user-select:none;-webkit-user-select:none;min-width:120px;touch-action:manipulation}.relay .nm:hover{text-decoration:underline dotted}
 .relay .nm input{font-size:16px;font-weight:700;width:14em;padding:3px 6px}
 .relay .meta{color:var(--mut);font-size:13px}.relay .sp{flex:1}
 .tile{border:1px solid var(--line);border-radius:10px;padding:8px;background:#121b27;display:flex;flex-direction:column;gap:4px}
@@ -2404,7 +2391,16 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 6px;b
 .nets{max-height:260px;overflow:auto;margin-top:8px}.nets div{padding:6px 8px;border-bottom:1px solid var(--line);cursor:pointer;display:flex;justify-content:space-between}.nets div:hover{background:#1f2b3c}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace}.mut{color:var(--mut)}.warnbox{border:1px solid var(--warn);background:#2a1f0a;color:#fde68a;border-radius:10px;padding:8px 10px;font-size:13px;margin:8px 0}
 .prog{height:6px;background:#0f1722;border-radius:4px;overflow:hidden;margin-top:4px}.prog i{display:block;height:100%;background:var(--acc)}
-@media(max-width:600px){nav a{padding:5px 7px;font-size:13px}.clock{font-size:13px;margin-left:0;width:100%;text-align:left}}
+@media(pointer:coarse){.btn.s{min-height:40px;padding:8px 10px;font-size:14px}.btn{min-height:42px}.btn.ic{min-height:36px;padding:4px 10px}input[type=checkbox]{width:22px;height:22px}.sched input[data-k]{min-height:38px}nav a{min-height:40px}}
+.gt td::before{display:none;content:attr(data-l);color:var(--mut);font-size:11px;font-weight:600;width:5.5em;flex:none}
+@media(max-width:700px){.gt table,.gt tbody,.gt tr,.gt td{display:block}.gt thead{display:none}.gt tr{border:1px solid var(--line);border-radius:10px;padding:8px;margin-bottom:8px}.gt td{border:0;padding:4px 0;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.gt td::before{display:inline-block}.gt td.ix{font-weight:700}.gt td.ix::before{display:none}.gt td select{flex:1;width:auto!important}.gt td.ac{justify-content:flex-start}}
+@media(max-width:700px){input[type=text],input[type=password],input[type=number],select,.sched input{font-size:16px}
+.sched table,.sched tbody,.sched tr,.sched td{display:block}.sched thead{display:none}.sched tr{border:1px solid var(--line);border-radius:10px;padding:8px;margin-bottom:8px}.sched td{border:0;padding:4px 0;white-space:normal}
+.sched td.lab::before{display:inline-block}.sched .f{display:flex}.sched input[data-k]{min-width:calc(3ch + 22px)}.sched select{width:100%!important}}
+@media(max-width:900px){header{row-gap:6px}.brand{order:1}.clock{order:2;margin-left:auto;text-align:right}nav{order:3;width:100%;flex:none;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:2px}nav::-webkit-scrollbar{display:none}nav a{white-space:nowrap;flex:none}}
+@media(pointer:coarse){input[type=text],input[type=password],input[type=number],select,.sched input[data-k]{font-size:16px}}
+@media(max-width:600px){.clock{font-size:13px}nav a{padding:6px 10px;font-size:13px}main{padding:10px}h1{font-size:18px}}
 )CSS";
 
 static const char APP_JS[] PROGMEM = R"JS(
@@ -2432,6 +2428,7 @@ var fail=function(e){toast((e&&e.message)||String(e),true);};
 var fmtUp=function(s){s=Math.floor(s);var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'d ':'')+p2(h)+':'+p2(m)+':'+p2(s%60);};
 var kb=function(n){return n>=1048576?(n/1048576).toFixed(2)+' MB':n>=1024?(n/1024).toFixed(1)+' KB':n+' B';};
 var DOW=['SUN','MON','TUE','WED','THU','FRI','SAT'];
+var fmtOff=function(ms){var a=Math.abs(ms),s=ms<0?'-':'+';if(a<1000)return ms+' ms';if(a<60000)return s+(a/1000).toFixed(2)+' s';if(a<86400000)return s+fmtUp(a/1000);return s+(a/86400000).toFixed(1)+' days';};
 var tm={ok:false};
 var devNowMs=function(){return tm.ok?(tm.e*1000+tm.ms)+(performance.now()-tm.at):null;};
 var fmtDate=function(d){return DOW[d.getUTCDay()]+' '+p2(d.getUTCMonth()+1)+'/'+p2(d.getUTCDate())+'/'+p2(d.getUTCFullYear()%100);};
@@ -2454,31 +2451,32 @@ var modeBtns=function(i,m){return '<span class="modes" data-i="'+i+'"><button cl
 var setMode=async function(i,m){try{await api('/api/relay/'+i+'/mode',{mode:m});}catch(e){fail(e);}};
 var bindModes=function(root,after){$$('.modes button',root).forEach(function(b){b.onclick=function(){var i=+b.parentNode.getAttribute('data-i');setMode(i,+b.getAttribute('data-m')).then(after);};});};
 var dash=function(){
-  var m=$('#main');m.innerHTML='<h1>Dashboard</h1><div class="grid" id="cards"></div><h2 style="margin-top:14px">Relays</h2><div class="tiles" id="tiles"></div><p class="hint">Auto = follows schedules &middot; manual overrides persist until set back to Auto. Names, pins and polarity are managed on the Relays / GPIO pages.</p>';
+  var m=$('#main');m.innerHTML='<h1>Dashboard</h1><div class="grid" id="cards"></div><div style="margin-top:8px"><button class="btn s" id="bsync">Sync NTP</button><button class="btn s" id="bbr">Sync from browser</button></div><h2 style="margin-top:14px">Relays</h2><div class="tiles" id="tiles"></div><p class="hint">Auto = follows schedules &middot; manual overrides persist until set back to Auto. Names, pins and polarity are managed on the Relays / GPIO pages.</p>';
+  $('#bsync').onclick=function(){api('/api/time/sync',{}).then(function(){toast('NTP sync requested');}).catch(fail);};
+  $('#bbr').onclick=browserSync;
   var load=async function(){try{var s=await api('/api/status');var t=s.time;
-    var cards='<div class="card"><h2>Time</h2><div class="kv"><b>Local</b><span class="mono">'+fmtEpoch(t.e)+'</span><b>Clock</b><span>'+(t.v?'<span class="badge ok">VALID</span>':'<span class="badge bad">NOT SET</span>')+' '+esc(t.src)+'</span><b>Zone</b><span class="mono">'+esc(t.tz)+'</span><b>NTP</b><span>'+esc(t.ntp.st)+(t.ntp.last?' &middot; last '+fmtEpoch(t.ntp.last):'')+(t.ntp.err?' &middot; <span class="mut">'+esc(t.ntp.err)+'</span>':'')+'</span><b>DS3231</b><span>'+(t.rtc.en?(t.rtc.ok?(t.rtc.lost?'<span class="badge warn">LOST POWER</span>':'<span class="badge ok">OK</span>')+' '+t.rtc.t.toFixed(1)+'&deg;C &middot; drift '+t.rtc.drift+'s':'<span class="badge bad">NOT FOUND</span>'):'disabled')+'</span></div><div style="margin-top:8px"><button class="btn s" id="bsync">Sync NTP</button><button class="btn s" id="bbr">Sync from browser</button></div></div>';
+    var cards='<div class="card"><h2>Time</h2><div class="kv"><b>Local</b><span class="mono">'+fmtEpoch(t.e)+'</span><b>Clock</b><span>'+(t.v?'<span class="badge ok">VALID</span>':'<span class="badge bad">NOT SET</span>')+' '+esc(t.src)+'</span><b>Zone</b><span class="mono">'+esc(t.tz)+'</span><b>NTP</b><span>'+esc(t.ntp.st)+(t.ntp.last?' &middot; last '+fmtEpoch(t.ntp.last):'')+(t.ntp.err?' &middot; <span class="mut">'+esc(t.ntp.err)+'</span>':'')+'</span><b>DS3231</b><span>'+(t.rtc.en?(t.rtc.ok?(t.rtc.lost?'<span class="badge warn">LOST POWER</span>':'<span class="badge ok">OK</span>')+' '+t.rtc.t.toFixed(1)+'&deg;C &middot; drift '+t.rtc.drift+'s':'<span class="badge bad">NOT FOUND</span>'):'disabled')+'</span></div></div>';
     cards+='<div class="card"><h2>WiFi Station</h2><div class="kv"><b>State</b><span>'+esc(s.sta.st)+'</span><b>SSID</b><span>'+esc(s.sta.ssid||'-')+'</span><b>IP</b><span class="mono">'+esc(s.sta.ip||'-')+'</span><b>RSSI</b><span>'+(s.sta.up?s.sta.rssi+' dBm (ch '+s.sta.ch+')':'-')+'</span><b>Drops</b><span>'+s.sta.drops+(s.sta.reasonTxt?' &middot; '+esc(s.sta.reasonTxt):'')+'</span></div></div>';
     cards+='<div class="card"><h2>WiFi Access Point</h2><div class="kv"><b>State</b><span>'+(s.ap.on?'<span class="badge ok">ON</span>':'<span class="badge off">OFF</span>')+(s.ap.captive?' captive portal':'')+'</span><b>SSID</b><span>'+esc(s.ap.ssid)+(s.ap.hidden?' (hidden)':'')+'</span><b>IP</b><span class="mono">'+esc(s.ap.ip||'-')+'</span><b>Clients</b><span>'+s.ap.clients+'</span><b>Channel</b><span>'+(s.ap.ch||'-')+'</span></div></div>';
     cards+='<div class="card"><h2>System</h2><div class="kv"><b>Host</b><span>'+esc(s.host)+'.local</span><b>Uptime</b><span>'+fmtUp(s.up)+'</span><b>Heap</b><span>'+kb(s.heap)+' free &middot; min '+kb(s.minHeap)+'</span><b>Largest block</b><span>'+kb(s.maxBlock)+'</span><b>Firmware</b><span>'+esc(s.fw)+'</span></div>'+(s.btn?'<div class="warnbox">BOOT button held '+(s.btn/1000).toFixed(1)+' s - factory reset at 5 s</div>':'')+'</div>';
     $('#cards').innerHTML=cards;
-    $('#bsync').onclick=function(){api('/api/time/sync').then(function(){toast('NTP sync requested');}).catch(fail);};
-    $('#bbr').onclick=browserSync;
-    $('#tiles').innerHTML=s.relays.map(function(r,i){return '<div class="tile"><div class="n" title="'+esc(r.n)+'">'+(i+1)+'. '+esc(r.n)+'</div><div class="st">'+stBadge(r.s)+'<span>'+(r.p>=0?'GPIO'+r.p:'no pin')+'</span></div><div class="st"><span>'+modeName(r.m)+'</span></div><div>'+modeBtns(i,r.m)+'</div></div>';}).join('');
-    bindModes($('#tiles'),load);
+    var tl=$('#tiles');if(tl.children.length===s.relays.length){s.relays.forEach(function(r,i){var t=tl.children[i];$('.n',t).textContent=(i+1)+'. '+r.n;$('.sb',t).innerHTML=stBadge(r.s);$('.pn',t).textContent=r.p>=0?'GPIO'+r.p:'no pin';$('.mn',t).textContent=modeName(r.m);var mb=$('.mbx',t);if(mb.getAttribute('data-m')!=String(r.m)){mb.setAttribute('data-m',r.m);mb.innerHTML=modeBtns(i,r.m);bindModes(mb,load);}});return;}
+    tl.innerHTML=s.relays.map(function(r,i){return '<div class="tile"><div class="n" title="'+esc(r.n)+'">'+(i+1)+'. '+esc(r.n)+'</div><div class="st"><span class="sb">'+stBadge(r.s)+'</span><span class="pn">'+(r.p>=0?'GPIO'+r.p:'no pin')+'</span></div><div class="st"><span class="mn">'+modeName(r.m)+'</span></div><div class="mbx" data-m="'+r.m+'">'+modeBtns(i,r.m)+'</div></div>';}).join('');
+    bindModes(tl,load);
   }catch(e){}}
   load();every(3000,load);
 }
 var FIELDS=[['sec','0-59'],['min','0-59'],['hour','0-23'],['dow','0-6'],['dom','1-31'],['mon','1-12'],['year','*']];
 var PRESETS=[['','Preset...'],['0 0 8 * * * *|0 0 17 * * * *','Daily 08:00 - 17:00'],['0 30 7 1-5 * * *|0 0 18 1-5 * * *','Weekdays 07:30 - 18:00'],['0 0 22 * * * *|0 0 6 * * * *','Overnight 22:00 - 06:00'],['0 0 9 0,6 * * *|0 0 21 0,6 * * *','Weekend 09:00 - 21:00'],['0 */15 * * * * *|30 */15 * * * * *','Every 15 min, on for 30 s'],['0 0 0 * 1 * *|0 0 0 * 2 * *','Monthly: 1st 00:00 - 2nd 00:00'],['0 0 12 * 29 2 *|0 0 13 * 29 2 *','Leap day Feb 29 12:00 - 13:00'],['clear','Clear pair']];
 var splitSpec=function(s){s=(s||'').trim();if(!s)return ['','','','','','',''];var t=s.split(/\s+/);while(t.length<7)t.push('*');return t.slice(0,7);};
-var specInputs=function(prefix,s){var v=splitSpec(s);return '<span class="f">'+FIELDS.map(function(f,i){return '<input type="text" data-k="'+prefix+'" data-f="'+i+'" value="'+esc(v[i])+'" placeholder="'+f[0]+'" title="'+f[0]+' ('+f[1]+')"'+(i===6?' class="y"':'')+'>';}).join('')+'</span>';};
-var joinSpec=function(root,prefix){var v=$$('input[data-k="'+prefix+'"]',root).map(function(i){return i.value.trim();});if(v.every(function(x){return !x;}))return '';return v.map(function(x){return x||'*';}).join(' ');};
+var specInputs=function(prefix,s){var v=splitSpec(s);return '<span class="f">'+FIELDS.map(function(f,i){return '<label class="fi"><small>'+f[0]+'</small><input type="text" autocapitalize="off" autocomplete="off" spellcheck="false" data-k="'+prefix+'" data-f="'+i+'" value="'+esc(v[i])+'" placeholder="*" title="'+f[0]+' ('+f[1]+')"'+(i===6?' class="y"':'')+'></label>';}).join('')+'</span>';};
+var joinSpec=function(root,prefix){var v=$$('input[data-k="'+prefix+'"]',root).map(function(i){return i.value.replace(/\s+/g,'');});if(v.every(function(x){return !x;}))return '';return v.map(function(x){return x||'*';}).join(' ');};
 var relays=function(){
-  var m=$('#main');m.innerHTML='<h1>Relays</h1><p class="hint">Double-tap / double-click a relay name to rename it. Each relay has 8 START/STOP pairs; the relay is ON while any enabled pair window is active. Fields: <code>sec min hour dow dom month year</code> &middot; syntax <code>*</code> <code>5</code> <code>1,3,5</code> <code>1-5</code> <code>*/10</code> <code>8-17/2</code> <code>mon-fri</code> <code>jan,jul</code> &middot; dow 0=Sun &middot; year <code>*</code> or <code>2026</code> or <code>2026-2030</code> &middot; empty START/STOP = never.</p><div id="list"></div>';
+  var m=$('#main');m.innerHTML='<h1>Relays</h1><p class="hint">Double-tap / double-click a relay name to rename it. Each relay has 8 START/STOP pairs; the relay is ON while any enabled pair window is active. Fields: <code>sec min hour dow dom month year</code> &middot; syntax <code>*</code> <code>5</code> <code>1,3,5</code> <code>1-5</code> <code>*/10</code> <code>8-17/2</code> <code>mon-fri</code> <code>jan,jul</code> &middot; dow 0=Sun (7 also = Sun) &middot; year <code>*</code> or <code>2026</code> or <code>2026-2030</code> &middot; all fields must match (dow AND dom) &middot; empty START/STOP = never.</p><div id="list"></div>';
   var open={};
   var refresh=async function(){try{var rs=await api('/api/relays');var list=$('#list');
-    if(list.children.length!==rs.length){list.innerHTML=rs.map(function(r,i){return '<div class="relay" data-i="'+i+'"><span class="mut">#'+(i+1)+'</span><span class="nm" data-i="'+i+'"></span><span class="state"></span><span class="meta"></span><span class="sp"></span><span class="mb"></span><button class="btn s tog">Schedules</button><div class="ed" style="flex-basis:100%;display:none"></div></div>';}).join('');
-      $$('.relay',list).forEach(function(el){var i=+el.getAttribute('data-i');$('.tog',el).onclick=function(){if(open[i]){open[i]=false;$('.ed',el).style.display='none';$('.ed',el).innerHTML='';}else{open[i]=true;loadEditor(i,el);}};bindName(el,i);});}
+    if(list.children.length!==rs.length){list.innerHTML=rs.map(function(r,i){return '<div class="relay" data-i="'+i+'"><span class="mut">#'+(i+1)+'</span><span class="nm" data-i="'+i+'"></span><button class="btn ic pen" title="Rename" aria-label="Rename relay">&#9998;</button><span class="state"></span><span class="meta"></span><span class="sp"></span><span class="mb"></span><button class="btn s tog">Schedules</button><div class="ed" style="flex-basis:100%;display:none"></div></div>';}).join('');
+      $$('.relay',list).forEach(function(el){var i=+el.getAttribute('data-i');$('.tog',el).onclick=function(){if(open[i]){open[i]=false;$('.ed',el).style.display='none';$('.ed',el).innerHTML='';$('.tog',el).textContent='Schedules';}else{open[i]=true;$('.tog',el).textContent='Hide';loadEditor(i,el);}};bindName(el,i);});}
     rs.forEach(function(r,i){var el=list.children[i];var nm=$('.nm',el);if(!nm.querySelector('input')&&nm.textContent!==r.n)nm.textContent=r.n;
       $('.state',el).innerHTML=stBadge(r.s);$('.meta',el).innerHTML=(r.p>=0?'GPIO'+r.p+' '+(r.al?'active-LOW':'active-HIGH'):'<span class="badge warn">NO PIN</span>')+' &middot; '+modeName(r.m)+' &middot; '+bits(r.en)+' pair(s)'+(r.act?' &middot; <span class="badge ok">window active</span>':'');
       var mb=$('.mb',el);if(mb.getAttribute('data-m')!=String(r.m)){mb.setAttribute('data-m',r.m);mb.innerHTML=modeBtns(i,r.m);bindModes(mb,refresh);}
@@ -2491,15 +2489,16 @@ var relays=function(){
       inp.onkeydown=function(e){if(e.key==='Enter')finish(true);if(e.key==='Escape')finish(false);};inp.onblur=function(){finish(true);};}
     nm.ondblclick=function(e){e.preventDefault();edit();};
     nm.addEventListener('touchend',function(e){var n=Date.now();if(n-last<350){e.preventDefault();edit();}last=n;},{passive:false});
-    nm.title='Double-tap to rename';}
+    nm.title='Double-tap to rename';$('.pen',el).onclick=edit;}
   var loadEditor=async function(i,el){var ed=$('.ed',el);ed.style.display='block';ed.innerHTML='<span class="mut">loading...</span>';
     try{var r=await api('/api/relay/'+i);
-      var h='<div class="sched"><table><thead><tr><th>#</th><th>On</th><th>START (sec min hour dow dom mon year)</th><th>STOP (sec min hour dow dom mon year)</th><th>Now</th><th></th></tr></thead><tbody>';
-      r.s.forEach(function(p,k){h+='<tr data-k="'+k+'"><td>'+(k+1)+'</td><td><input type="checkbox" class="en"'+(p.en?' checked':'')+'></td><td>'+specInputs('a'+k,p.a)+'</td><td>'+specInputs('b'+k,p.b)+'</td><td class="act">'+(p.act?'<span class="badge ok">active</span>':'<span class="badge off">idle</span>')+'</td><td><select class="pre" style="width:9em">'+PRESETS.map(function(x){return '<option value="'+esc(x[0])+'">'+esc(x[1])+'</option>';}).join('')+'</select></td></tr>';});
+      var h='<div class="sched"><table><thead><tr><th>Pair</th><th>START (relay turns ON)</th><th>STOP (relay turns OFF)</th><th>Now</th><th>Preset</th></tr></thead><tbody>';
+      r.s.forEach(function(p,k){h+='<tr data-k="'+k+'"><td class="num"><label class="chk" style="margin:0"><input type="checkbox" class="en"'+(p.en?' checked':'')+'> <b>#'+(k+1)+'</b> <span class="mut">enabled</span></label></td><td class="lab" data-l="START">'+specInputs('a'+k,p.a)+'</td><td class="lab" data-l="STOP">'+specInputs('b'+k,p.b)+'</td><td class="lab act" data-l="NOW">'+(p.act?'<span class="badge ok">active</span>':'<span class="badge off">idle</span>')+'</td><td><select class="pre" style="width:9em" title="Fill this pair from a preset">'+PRESETS.map(function(x){return '<option value="'+esc(x[0])+'">'+esc(x[1])+'</option>';}).join('')+'</select></td></tr>';});
       h+='</tbody></table></div><div style="margin-top:8px"><button class="btn p save">Save schedules</button><button class="btn reload">Reload</button> <span class="mut msg"></span></div>';
       ed.innerHTML=h;
+      var fit=function(i){i.style.width='calc('+Math.max(3,i.value.length+1)+'ch + 16px)';};$$('input[data-k]',ed).forEach(function(i){fit(i);i.oninput=function(){fit(i);};});
       $$('.pre',ed).forEach(function(sel){sel.onchange=function(){var tr=sel.closest('tr');var k=tr.getAttribute('data-k');var v=sel.value;sel.value='';if(!v)return;var a='',b='';if(v!=='clear'){var parts=v.split('|');a=parts[0];b=parts[1]||'';}
-        var va=splitSpec(a),vb=splitSpec(b);$$('input[data-k="a'+k+'"]',tr).forEach(function(inp,f){inp.value=va[f];});$$('input[data-k="b'+k+'"]',tr).forEach(function(inp,f){inp.value=vb[f];});$('.en',tr).checked=v!=='clear';};});
+        var va=splitSpec(a),vb=splitSpec(b);$$('input[data-k="a'+k+'"]',tr).forEach(function(inp,f){inp.value=va[f];fit(inp);});$$('input[data-k="b'+k+'"]',tr).forEach(function(inp,f){inp.value=vb[f];fit(inp);});$('.en',tr).checked=v!=='clear';};});
       $('.save',ed).onclick=async function(){var s=[];$$('tbody tr',ed).forEach(function(tr,k){s.push({en:$('.en',tr).checked,a:joinSpec(tr,'a'+k),b:joinSpec(tr,'b'+k)});});
         try{await api('/api/relay/'+i,{s:s});$('.msg',ed).textContent='Saved';toast('Schedules saved');refresh();}catch(e){$('.msg',ed).textContent=e.message;fail(e);}};
       $('.reload',ed).onclick=function(){loadEditor(i,el);};
@@ -2507,12 +2506,18 @@ var relays=function(){
   refresh();every(2000,refresh);
 }
 var gpio=function(){
-  var m=$('#main');m.innerHTML='<h1>GPIO</h1><div class="card"><div><button class="btn p" id="gh">Global HIGH</button><button class="btn p" id="gl">Global LOW</button><button class="btn" id="ga">All relays back to Auto</button></div><p class="hint">Set HIGH / LOW drives the physical pin level and switches that relay to manual mode (ON/OFF depends on its polarity). Remove releases the GPIO (input, relay unassigned). Changes to pin / polarity apply immediately and are saved.</p><div id="sd"></div></div><div class="card" style="margin-top:12px;overflow-x:auto"><table id="gt"><thead><tr><th>#</th><th>Relay</th><th>GPIO</th><th>Polarity</th><th>Level</th><th>State</th><th>Mode</th><th>Actions</th></tr></thead><tbody></tbody></table></div>';
+  var m=$('#main');m.innerHTML='<h1>GPIO</h1><div class="card"><div><button class="btn p" id="gh">Global HIGH</button><button class="btn p" id="gl">Global LOW</button><button class="btn" id="ga">All relays back to Auto</button></div><p class="hint">Set HIGH / LOW drives the physical pin level and switches that relay to manual mode (ON/OFF depends on its polarity). Remove releases the GPIO (input, relay unassigned). Changes to pin / polarity apply immediately and are saved.</p><div id="sd"></div></div><div class="card gt" style="margin-top:12px;overflow-x:auto"><table id="gt"><thead><tr><th>#</th><th>Relay</th><th>GPIO</th><th>Polarity</th><th>Level</th><th>State</th><th>Mode</th><th>Actions</th></tr></thead><tbody></tbody></table></div>';
   var pins=[];
   var load=async function(){try{var g=await api('/api/gpio');pins=g.pins;if(g.serialDebug)$('#sd').innerHTML='<div class="warnbox">Serial debug build: GPIO1/GPIO3 are reserved for the UART and will not be driven.</div>';
     var used={};g.r.forEach(function(r){if(r.p>=0)used[r.p]=r.n;});
-    $('#gt tbody').innerHTML=g.r.map(function(r,i){var opts='<option value="-1"'+(r.p<0?' selected':'')+'>none</option>'+pins.map(function(p){var u=used[p]&&p!==r.p;return '<option value="'+p+'"'+(p===r.p?' selected':'')+(u?' disabled':'')+'>GPIO'+p+(u?' (used)':'')+'</option>';}).join('');
-      return '<tr data-i="'+i+'"><td>'+(i+1)+'</td><td>'+esc(r.n)+'</td><td><select class="pin">'+opts+'</select></td><td><select class="al"><option value="1"'+(r.al?' selected':'')+'>Active LOW</option><option value="0"'+(!r.al?' selected':'')+'>Active HIGH</option></select></td><td>'+(r.lv<0?'<span class="mut">-</span>':'<span class="badge '+(r.lv?'on':'off')+'">'+(r.lv?'HIGH':'LOW')+'</span>')+'</td><td>'+stBadge(r.s)+'</td><td>'+modeName(r.m)+'</td><td><button class="btn s hi">Set HIGH</button><button class="btn s lo">Set LOW</button><button class="btn s au">Auto</button><button class="btn s r rm">Remove</button></td></tr>';}).join('');
+    var tb=$('#gt tbody');var ae=document.activeElement;
+    var lvl=function(r){return r.lv<0?'<span class="mut">-</span>':'<span class="badge '+(r.lv?'on':'off')+'">'+(r.lv?'HIGH':'LOW')+'</span>';};
+    if(tb.children.length===g.r.length){
+      g.r.forEach(function(r,i){var tr=tb.children[i];$('.rn',tr).textContent=r.n;$('.lv',tr).innerHTML=lvl(r);$('.st',tr).innerHTML=stBadge(r.s);$('.md',tr).textContent=modeName(r.m);
+        if(!(ae&&tr.contains(ae))){var sp=$('.pin',tr);if(String(sp.value)!==String(r.p))sp.value=String(r.p);$$('option',sp).forEach(function(o){var p=+o.value;o.disabled=p>=0&&!!used[p]&&p!==r.p;o.textContent=p<0?'none':'GPIO'+p+(o.disabled?' (used)':'');});var sa=$('.al',tr);if(sa.value!==(r.al?'1':'0'))sa.value=r.al?'1':'0';}});
+      return;}
+    tb.innerHTML=g.r.map(function(r,i){var opts='<option value="-1"'+(r.p<0?' selected':'')+'>none</option>'+pins.map(function(p){var u=used[p]&&p!==r.p;return '<option value="'+p+'"'+(p===r.p?' selected':'')+(u?' disabled':'')+'>GPIO'+p+(u?' (used)':'')+'</option>';}).join('');
+      return '<tr data-i="'+i+'"><td class="ix">#'+(i+1)+'</td><td class="rn" data-l="Relay">'+esc(r.n)+'</td><td data-l="GPIO"><select class="pin">'+opts+'</select></td><td data-l="Polarity"><select class="al"><option value="1"'+(r.al?' selected':'')+'>Active LOW</option><option value="0"'+(!r.al?' selected':'')+'>Active HIGH</option></select></td><td class="lv" data-l="Level">'+lvl(r)+'</td><td class="st" data-l="State">'+stBadge(r.s)+'</td><td class="md" data-l="Mode">'+modeName(r.m)+'</td><td class="ac" data-l="Actions"><button class="btn s hi">Set HIGH</button><button class="btn s lo">Set LOW</button><button class="btn s au">Auto</button><button class="btn s r rm">Remove</button></td></tr>';}).join('');
     $$('#gt tbody tr').forEach(function(tr){var i=+tr.getAttribute('data-i');
       $('.pin',tr).onchange=function(){api('/api/gpio/'+i,{pin:+this.value,al:$('.al',tr).value==='1'}).then(function(){toast('GPIO updated');load();}).catch(function(e){fail(e);load();});};
       $('.al',tr).onchange=function(){api('/api/gpio/'+i,{pin:+$('.pin',tr).value,al:this.value==='1'}).then(function(){toast('Polarity updated');load();}).catch(function(e){fail(e);load();});};
@@ -2529,32 +2534,33 @@ var gpio=function(){
 var timePage=function(){
   var m=$('#main');m.innerHTML='<h1>Time</h1><div class="grid"><div class="card" id="tstat"></div><div class="card"><h2>Actions</h2><button class="btn p" id="bn">Sync NTP now</button><button class="btn" id="bb">Sync from browser</button><button class="btn" id="bz">Use browser time zone</button><button class="btn" id="bd">Detect time zone (IP)</button><button class="btn" id="br">Load clock from DS3231</button><button class="btn" id="bw">Write clock to DS3231</button><p class="hint">"Sync from browser" sets the device clock (and the DS3231) from this device - use it when NTP is unreachable. With "automatic browser sync" enabled below, any opened page does this by itself while the clock is invalid.</p></div></div><div class="card" style="margin-top:12px"><h2>Settings</h2><form id="tf"></form></div>';
   var stat=async function(){try{var t=await api('/api/time');var n=t.ntp,r=t.rtc;
-    $('#tstat').innerHTML='<h2>Status</h2><div class="kv"><b>Local time</b><span class="mono">'+fmtEpoch(t.e)+'</span><b>UTC</b><span class="mono">'+(function(){var d=new Date(t.e*1000);return fmtDate(d)+' '+fmtTime(d);})()+'</span><b>UTC offset</b><span>'+(t.o>=0?'+':'')+(t.o/3600).toFixed(2)+' h ('+t.o+' s)</span><b>Clock</b><span>'+(t.v?'<span class="badge ok">VALID</span>':'<span class="badge bad">NOT SET</span>')+' source: '+esc(t.src)+(t.set?' &middot; set '+fmtEpoch(t.set):'')+'</span><b>TZ rule</b><span class="mono">'+esc(t.tz)+' <span class="mut">('+esc(t.tzs)+')</span></span>'+(t.tzMode==1?'<b>Auto TZ</b><span>'+esc(t.tzr)+'</span>':'')+'<b>NTP</b><span>'+esc(n.st)+(n.cur&&n.st!=='idle'&&n.st!=='offline'?' '+esc(n.cur):'')+'</span><b>Last NTP</b><span>'+(n.last?fmtEpoch(n.last)+' via '+esc(n.srv)+' (offset '+n.off+' ms)':'never')+'</span><b>Next NTP</b><span>'+(n.next?fmtUp(n.next):'-')+' &middot; interval '+n.iv+' min &middot; ok '+n.ok+' / failed cycles '+n.fails+(n.err?' &middot; <span class="badge warn">'+esc(n.err)+'</span>':'')+'</span><b>DS3231</b><span>'+(r.en?(r.ok?(r.lost?'<span class="badge warn">LOST POWER</span>':'<span class="badge ok">PRESENT</span>')+' '+fmtEpoch(r.e)+' &middot; '+r.t.toFixed(2)+'&deg;C &middot; drift '+r.drift+' s &middot; writes '+r.w:'<span class="badge bad">NOT FOUND</span> (SDA 21 / SCL 22)'):'disabled')+'</span></div>';
+    $('#tstat').innerHTML='<h2>Status</h2><div class="kv"><b>Local time</b><span class="mono">'+fmtEpoch(t.e)+'</span><b>UTC</b><span class="mono">'+(function(){var d=new Date(t.e*1000);return fmtDate(d)+' '+fmtTime(d);})()+'</span><b>UTC offset</b><span>'+(t.o>=0?'+':'')+(t.o/3600).toFixed(2)+' h ('+t.o+' s)</span><b>Clock</b><span>'+(t.v?'<span class="badge ok">VALID</span>':'<span class="badge bad">NOT SET</span>')+' source: '+esc(t.src)+(t.set?' &middot; set '+fmtEpoch(t.set):'')+'</span><b>TZ rule</b><span class="mono">'+esc(t.tz)+' <span class="mut">('+esc(t.tzs)+')</span></span>'+(t.tzMode==1?'<b>Auto TZ</b><span>'+esc(t.tzr)+'</span>':'')+'<b>NTP</b><span>'+esc(n.st)+(n.cur&&n.st!=='idle'&&n.st!=='offline'?' '+esc(n.cur):'')+'</span><b>Last NTP</b><span>'+(n.last?fmtEpoch(n.last)+' via '+esc(n.srv)+' (step '+fmtOff(n.off)+')':'never')+'</span><b>Next NTP</b><span>'+(n.next?fmtUp(n.next):'-')+' &middot; interval '+n.iv+' min &middot; ok '+n.ok+' / failed cycles '+n.fails+(n.err?' &middot; <span class="badge warn">'+esc(n.err)+'</span>':'')+'</span><b>DS3231</b><span>'+(r.en?(r.ok?(r.lost?'<span class="badge warn">LOST POWER</span>':'<span class="badge ok">PRESENT</span>')+' '+fmtEpoch(r.e)+' &middot; '+r.t.toFixed(2)+'&deg;C &middot; drift '+r.drift+' s &middot; writes '+r.w:'<span class="badge bad">NOT FOUND</span> (SDA 21 / SCL 22)'):'disabled')+'</span></div>';
   }catch(e){}}
   var sel=function(name,opts,val){return '<select name="'+name+'">'+opts.map(function(o){return '<option value="'+o[0]+'"'+(String(o[0])===String(val)?' selected':'')+'>'+esc(o[1])+'</option>';}).join('')+'</select>';};
   var MONTHS=[[1,'Jan'],[2,'Feb'],[3,'Mar'],[4,'Apr'],[5,'May'],[6,'Jun'],[7,'Jul'],[8,'Aug'],[9,'Sep'],[10,'Oct'],[11,'Nov'],[12,'Dec']],WEEKS=[[1,'1st'],[2,'2nd'],[3,'3rd'],[4,'4th'],[5,'last']],DAYS=[[0,'Sun'],[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat']];
   var form=async function(){try{var c=await api('/api/time/cfg');var f=$('#tf');
     f.innerHTML='<h3>NTP</h3><div class="row">'+[0,1,2,3].map(function(i){return '<div><label>Server '+(i+1)+'</label><input type="text" name="ntp'+i+'" value="'+esc(c.ntp[i]||'')+'" maxlength="48"></div>';}).join('')+'</div><div class="row"><div><label>Auto sync interval (minutes, 1 - 1440 = 24 h)</label><input type="number" name="interval" min="1" max="1440" value="'+c.interval+'"></div><div><label>Reply timeout per server (ms)</label><input type="number" name="timeout" min="500" max="10000" value="'+c.timeout+'"></div></div><label class="chk"><input type="checkbox" name="rotate"'+(c.rotate?' checked':'')+'> Rotate servers (round-robin each sync). Off = always start with server 1, fall back to the next on failure.</label>'
       +'<h3>Clock sources</h3><label class="chk"><input type="checkbox" name="rtc"'+(c.rtc?' checked':'')+'> Use DS3231 RTC (I2C SDA 21 / SCL 22): seeds the clock at boot, keeps it disciplined while offline, written after every NTP / browser sync.</label><label class="chk"><input type="checkbox" name="autoBrowser"'+(c.autoBrowser?' checked':'')+'> Automatic browser sync when the clock is not set (NTP unreachable, no RTC).</label>'
-      +'<h3>Time zone</h3><div class="row"><div><label>Mode</label>'+sel('tzMode',[[0,'Manual (offset / rules / POSIX)'],[1,'Automatic (IP geolocation + DST rules)']],c.tzMode)+'</div><div><label>GMT offset in seconds (e.g. -18000 = UTC-5, 3600 = UTC+1)</label><input type="number" name="gmtOffset" min="-50400" max="50400" step="1" value="'+c.gmtOffset+'"></div><div><label>DST offset (seconds)</label><input type="number" name="dstOffset" min="-7200" max="7200" value="'+c.dstOffset+'"></div></div>'
+      +'<h3>Time zone</h3><div class="row"><div><label>Mode</label>'+sel('tzMode',[[0,'Manual (offset / rules / POSIX)'],[1,'Automatic (IP geolocation + DST rules)']],c.tzMode)+'</div><div><label>GMT offset in seconds (e.g. -18000 = UTC-5, 3600 = UTC+1) <span class="mut" id="offh"></span></label><input type="number" name="gmtOffset" min="-50400" max="50400" step="1" value="'+c.gmtOffset+'"></div><div><label>DST offset (seconds)</label><input type="number" name="dstOffset" min="-7200" max="7200" value="'+c.dstOffset+'"></div></div>'
       +'<label class="chk"><input type="checkbox" name="dst"'+(c.dst?' checked':'')+'> Daylight saving time rules enabled</label><div class="row"><div><label>DST starts</label><div class="row">'+sel('dsM',MONTHS,c.dsM)+sel('dsW',WEEKS,c.dsW)+sel('dsD',DAYS,c.dsD)+'<input type="number" name="dsH" min="0" max="24" value="'+c.dsH+'" title="hour (local standard time)"></div></div><div><label>DST ends</label><div class="row">'+sel('deM',MONTHS,c.deM)+sel('deW',WEEKS,c.deW)+sel('deD',DAYS,c.deD)+'<input type="number" name="deH" min="0" max="24" value="'+c.deH+'" title="hour (local DST time)"></div></div></div>'
       +'<div><span class="mut" style="font-size:12px">Presets:</span> <button type="button" class="btn s" data-p="us">USA/Canada</button><button type="button" class="btn s" data-p="eu">EU (CET)</button><button type="button" class="btn s" data-p="uk">UK/Portugal</button><button type="button" class="btn s" data-p="au">Australia SE</button><button type="button" class="btn s" data-p="nz">New Zealand</button></div>'
       +'<label>POSIX TZ override (manual mode; empty = use the fields above) e.g. <code>EST5EDT,M3.2.0,M11.1.0</code></label><input type="text" name="posix" maxlength="64" value="'+esc(c.posix)+'">'
       +(c.acValid?'<p class="hint">Last automatic detection: <b>'+esc(c.acName)+'</b> &rarr; '+(c.acPosix?'<code>'+esc(c.acPosix)+'</code>':'fixed offset '+c.acOffset+' s (no rule in table - refreshed hourly)')+'</p>':'')
       +'<p class="hint">Active rule now: <code>'+esc(c.tzNow)+'</code></p><div style="margin-top:10px"><button class="btn p" type="submit">Save time settings</button></div>';
+    var offh=function(){var v=+f.gmtOffset.value||0,a=Math.abs(v);$('#offh').textContent='= UTC'+(v<0?'-':'+')+p2(Math.floor(a/3600))+':'+p2(Math.floor(a%3600/60))+(a%60?':'+p2(a%60):'');};f.gmtOffset.oninput=offh;offh();
     var P={us:[-18000,3,2,0,2,11,1,0,2],eu:[3600,3,5,0,2,10,5,0,3],uk:[0,3,5,0,1,10,5,0,2],au:[36000,10,1,0,2,4,1,0,3],nz:[43200,9,5,0,2,4,1,0,3]};
-    $$('button[data-p]',f).forEach(function(b){b.onclick=function(){var p=P[b.getAttribute('data-p')];f.gmtOffset.value=p[0];f.dst.checked=true;f.dstOffset.value=3600;f.dsM.value=p[1];f.dsW.value=p[2];f.dsD.value=p[3];f.dsH.value=p[4];f.deM.value=p[5];f.deW.value=p[6];f.deD.value=p[7];f.deH.value=p[8];f.posix.value='';f.tzMode.value='0';};});
+    $$('button[data-p]',f).forEach(function(b){b.onclick=function(){var p=P[b.getAttribute('data-p')];f.gmtOffset.value=p[0];f.dst.checked=true;f.dstOffset.value=3600;f.dsM.value=p[1];f.dsW.value=p[2];f.dsD.value=p[3];f.dsH.value=p[4];f.deM.value=p[5];f.deW.value=p[6];f.deD.value=p[7];f.deH.value=p[8];f.posix.value='';f.tzMode.value='0';offh();};});
     f.onsubmit=async function(e){e.preventDefault();var b={ntp:[0,1,2,3].map(function(i){return f['ntp'+i].value.trim();}),interval:+f.interval.value,timeout:+f.timeout.value,rotate:f.rotate.checked,rtc:f.rtc.checked,autoBrowser:f.autoBrowser.checked,tzMode:+f.tzMode.value,gmtOffset:+f.gmtOffset.value,dst:f.dst.checked,dstOffset:+f.dstOffset.value,posix:f.posix.value.trim()};
       ['dsM','dsW','dsD','dsH','deM','deW','deD','deH'].forEach(function(k){b[k]=+f[k].value;});
       try{await api('/api/time/cfg',b);toast('Time settings saved');form();stat();pollTime();}catch(e){fail(e);}};
   }catch(e){fail(e);}}
-  $('#bn').onclick=function(){api('/api/time/sync').then(function(){toast('NTP sync started');setTimeout(stat,1500);}).catch(fail);};
+  $('#bn').onclick=function(){api('/api/time/sync',{}).then(function(){toast('NTP sync started');setTimeout(stat,1500);}).catch(fail);};
   $('#bb').onclick=function(){browserSync().then(stat);};
   $('#bz').onclick=function(){var iana='';try{iana=Intl.DateTimeFormat().resolvedOptions().timeZone||'';}catch(e){}var off=-new Date().getTimezoneOffset()*60;
     api('/api/time/tz',{iana:iana,offset:off}).then(function(r){toast(r.found?'Zone '+iana+' applied with DST rules':'Zone '+(iana||'?')+' not in table - fixed offset '+off+' s applied');form();stat();pollTime();}).catch(fail);};
-  $('#bd').onclick=function(){api('/api/time/tzdetect').then(function(){toast('Detection started (needs internet)');setTimeout(function(){form();stat();pollTime();},4000);}).catch(fail);};
-  $('#br').onclick=function(){api('/api/time/rtcread').then(function(){toast('Clock will be loaded from DS3231');setTimeout(function(){stat();pollTime();},1500);}).catch(fail);};
-  $('#bw').onclick=function(){api('/api/time/rtcwrite').then(function(){toast('DS3231 will be written');setTimeout(stat,1500);}).catch(fail);};
+  $('#bd').onclick=function(){api('/api/time/tzdetect',{}).then(function(){toast('Detection started (needs internet)');setTimeout(function(){form();stat();pollTime();},4000);}).catch(fail);};
+  $('#br').onclick=function(){api('/api/time/rtcread',{}).then(function(){toast('Clock will be loaded from DS3231');setTimeout(function(){stat();pollTime();},1500);}).catch(fail);};
+  $('#bw').onclick=function(){api('/api/time/rtcwrite',{}).then(function(){toast('DS3231 will be written');setTimeout(stat,1500);}).catch(fail);};
   stat();form();every(2000,stat);
 }
 var sta=function(){
@@ -2588,7 +2594,7 @@ var ap=function(){
 var system=function(){
   var m=$('#main');m.innerHTML='<h1>System</h1><div class="grid" id="sg"></div><div class="card" style="margin-top:12px"><h2>Maintenance</h2><button class="btn" id="bk">Download config backup</button><button class="btn" id="rb">Reboot</button><button class="btn r" id="fr">Factory reset</button><p class="hint">Factory reset erases all settings (WiFi, time, GPIO map, relays) and reboots into the default access point. Holding the BOOT button (GPIO0) for 5 seconds does the same.</p><div id="bt"></div></div>';
   var load=async function(){try{var s=await api('/api/system');var t=s.time;
-    var h='<div class="card"><h2>Device</h2><div class="kv"><b>Chip</b><span>'+esc(s.chip)+' rev '+s.rev+', '+s.cores+' core(s) @ '+s.mhz+' MHz</span><b>SDK</b><span>'+esc(s.sdk)+'</span><b>Firmware</b><span>'+esc(s.fw)+'</span><b>Flash</b><span>'+kb(s.flash)+'</span><b>Sketch</b><span>'+kb(s.sketch)+' used, '+kb(s.sketchFree)+' free</span><b>PSRAM</b><span>'+(s.psram?kb(s.psram):'none')+'</span><b>Reset reason</b><span>'+esc(s.reset)+'</span><b>Uptime</b><span>'+fmtUp(s.up)+'</span><b>Serial debug</b><span>'+(s.serialDebug?'on (GPIO1/3 reserved)':'off')+'</span><b>I2C</b><span>'+esc(s.i2c)+'</span></div></div>';
+    var h='<div class="card"><h2>Device</h2><div class="kv"><b>Chip</b><span>'+esc(s.chip)+' rev '+s.rev+', '+s.cores+' core(s) @ '+s.mhz+' MHz</span><b>SDK</b><span>'+esc(s.sdk)+'</span><b>Firmware</b><span>'+esc(s.fw)+'</span><b>Flash</b><span>'+kb(s.flash)+'</span><b>Sketch</b><span>'+kb(s.sketch)+' used, '+kb(s.sketchFree)+' free</span><b>PSRAM</b><span>'+(s.psram?kb(s.psram):'none')+'</span><b>Reset reason</b><span>'+esc(s.reset)+'</span><b>Uptime</b><span>'+fmtUp(s.up)+'</span><b>Serial debug</b><span>'+(s.serialDebug?'on (GPIO1/3 reserved)':'off')+'</span><b>Clock range</b><span>'+(s.timeT64?'64-bit time_t: valid beyond 2038':'<span class="badge warn">32-bit time_t</span> valid until 2038-01-19 - build with core 3.x')+'</span><b>I2C</b><span>'+esc(s.i2c)+'</span></div></div>';
     var frag=s.maxBlock&&s.heap?Math.round(100-100*s.maxBlock/s.heap):0;
     h+='<div class="card"><h2>Memory</h2><div class="kv"><b>Heap free</b><span>'+kb(s.heap)+' of '+kb(s.heapTotal)+'</span><b>Min free ever</b><span>'+kb(s.minHeap)+'</span><b>Largest block</b><span>'+kb(s.maxBlock)+'</span><b>Fragmentation</b><span>'+frag+' %</span></div><div class="prog"><i style="width:'+Math.round(100*s.heap/s.heapTotal)+'%"></i></div></div>';
     h+='<div class="card"><h2>Storage (LittleFS)</h2><div class="kv"><b>Mounted</b><span>'+(s.fsOk?'yes':'<span class="badge bad">NO</span>')+'</span><b>Used</b><span>'+kb(s.fsUsed)+' / '+kb(s.fsTotal)+'</span><b>Pending writes</b><span>'+(s.dirty?'yes (debounced)':'none')+'</span></div><h3>Config files</h3><table>'+(s.files.length?s.files.map(function(f){return '<tr><td class="mono">'+esc(f.n)+'</td><td>'+f.s+' B</td></tr>';}).join(''):'<tr><td class="mut">no files yet (defaults in use)</td></tr>')+'</table></div>';
@@ -2660,9 +2666,10 @@ static void setupRoutes() {
 
 void setup() {
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+  checkTimeTWidth(std::conditional<(sizeof(time_t) >= 8), TimeTIs64, TimeTIs32>::type());
 
   fsOk = LittleFS.begin(false);
-  if (!fsOk) { LOGF("[FS] mount failed, formatting\n"); fsOk = LittleFS.begin(true); }
+  if (!fsOk) { fsOk = LittleFS.begin(true); }
   if (fsOk && !LittleFS.exists(CFG_DIR)) LittleFS.mkdir(CFG_DIR);
   loadAllConfig();
   initAllPins();
@@ -2681,7 +2688,6 @@ void setup() {
 
   setupRoutes();
   server.begin();
-  LOGF("[WEB] ready\n");
 }
 
 void loop() {
