@@ -976,7 +976,7 @@ static int readPinLevel(uint8_t i) {
   int pin = gpioCfg.pin[i];
   if (pin < 0) return -1;
   if (!relays[i].driven) return -1;
-  return physicalLevel(i, relays[i].state);
+  return digitalRead(pin);
 }
 
 static void initAllPins() {
@@ -1544,6 +1544,7 @@ static uint32_t staAttemptMs = 0;
 static uint32_t staNextTryMs = 0;
 static uint32_t staAttempts = 0;
 static uint32_t staDisconnects = 0;
+static uint32_t staBackoffMs = 0;
 static uint8_t  staLastReason = 0;
 static uint32_t staUpSinceMs = 0;
 static time_t   staUpSinceEpoch = 0;
@@ -1643,6 +1644,7 @@ static void staStop() {
 static void onStaUp() {
   staHasIp = true;
   staConnecting = false;
+  staBackoffMs = 0;
   staUpSinceMs = millis();
   staUpSinceEpoch = time(nullptr);
   ntpTriggerNow();
@@ -1656,7 +1658,8 @@ static void onStaDown(uint8_t reason) {
   staConnecting = false;
   staLastReason = reason;
   staDisconnects++;
-  staNextTryMs = millis() + 2000;
+  staBackoffMs = staBackoffMs ? min<uint32_t>(staBackoffMs * 2, 30000) : 2000;
+  staNextTryMs = millis() + staBackoffMs;
   if (ntpState != NTP_IDLE) { ntpAbort(); ntpDueNow = true; }
   if (tzState != TZ_IDLE) tzClose();
   if (wasUp) rtcRequestAlignSet();
@@ -1715,12 +1718,13 @@ static void wifiTick() {
     if (staConnecting && elapsed(staAttemptMs, 20000)) {
       staConnecting = false;
       WiFi.disconnect(false, false);
-      staNextTryMs = millis() + 2000;
+      staBackoffMs = staBackoffMs ? min<uint32_t>(staBackoffMs * 2, 30000) : 2000;
+      staNextTryMs = millis() + staBackoffMs;
     }
     if (!staConnecting && (int32_t)(millis() - staNextTryMs) >= 0) {
       if (!(WiFi.getMode() & WIFI_MODE_STA)) WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
       staBegin();
-      staNextTryMs = millis() + 2000;
+      staNextTryMs = millis() + staBackoffMs;
     }
   }
 
@@ -1870,7 +1874,7 @@ static void fillTimeStatus(JsonObject o) {
   n["err"] = ntpLastErr;
   n["fails"] = ntpFailCycles;
   n["ok"] = ntpOkCount;
-  n["off"] = (long)ntpLastOffsetMs;
+  n["off"] = (int64_t)ntpLastOffsetMs;
   n["n"] = ntpServerCount();
   n["iv"] = timeCfg.intervalMin;
   JsonObject r = o["rtc"].to<JsonObject>();
@@ -1973,13 +1977,16 @@ static void apiTimeCfgPost() {
   JsonArray n = d["ntp"];
   if (!n.isNull()) {
     if (n.size() > NTP_SERVERS) { sendErr(400, "max 4 NTP servers"); return; }
+    bool anyNtp = false;
     for (uint8_t i = 0; i < NTP_SERVERS; i++) {
       char h[49] = "";
       if (i < n.size() && n[i].is<const char*>()) strcopy(h, sizeof h, n[i]);
       trimInPlace(h);
       if (h[0] && !validHostOrIp(h)) { char m[80]; snprintf(m, sizeof m, "NTP server %u is not a valid host name", i + 1); sendErr(400, m); return; }
       strcopy(t.ntp[i], 49, h);
+      if (t.ntp[i][0]) anyNtp = true;
     }
+    if (!anyNtp) { sendErr(400, "at least one NTP server is required"); return; }
   }
   if (d["interval"].is<int>()) { int v = d["interval"]; if (v < 1 || v > 1440) { sendErr(400, "sync interval must be 1..1440 minutes"); return; } t.intervalMin = v; }
   if (d["timeout"].is<int>())  { int v = d["timeout"];  if (v < 500 || v > 10000) { sendErr(400, "timeout must be 500..10000 ms"); return; } t.timeoutMs = v; }
@@ -2173,7 +2180,9 @@ static void apiGpioLevel() {
   int lvl = d["level"] | -1;
   if (lvl != 0 && lvl != 1) { sendErr(400, "level must be 0 or 1"); return; }
   if (gpioCfg.pin[i] < 0) { sendErr(409, "relay has no GPIO assigned"); return; }
-  setRelayLevel(i, lvl ? HIGH : LOW);
+  if (!relays[i].driven) { sendErr(409, "GPIO is reserved or not drivable in this build"); return; }
+  relays[i].mode = lvl ? 1 : 2;
+  markDirty(D_RELAY0 << i);
   applyOutputs(false);
   sendOk();
 }
@@ -2181,7 +2190,7 @@ static void apiGpioLevel() {
 static void apiGpioAll() {
   JsonDocument d; if (!readBody(d)) return;
   if (d["auto"] | false) {
-    for (uint8_t i = 0; i < NUM_RELAYS; i++) if (relays[i].mode != 0) { relays[i].mode = 0; markDirty(D_RELAY0 << i); }
+    for (uint8_t i = 0; i < NUM_RELAYS; i++) if (relays[i].mode != 0) { relays[i].mode = 0; recalcRelayNow(i); markDirty(D_RELAY0 << i); }
     applyOutputs(false); sendOk(); return;
   }
   int lvl = d["level"] | -1;
@@ -2220,9 +2229,9 @@ static void apiNetStaPost() {
   bool staChanged = memcmp(&s, &netCfg.sta, sizeof(StaCfg)) != 0;
   netCfg.sta = s;
   strcopy(netCfg.hostname, sizeof netCfg.hostname, host);
-  markDirty(D_NET);
+  if (staChanged || hostChanged) markDirty(D_NET);
   uint8_t what = 0;
-  if (staChanged || (d["connect"] | false)) what |= 1;
+  if (staChanged || (d["connect"] | false)) { what |= 1; if (staChanged) staBackoffMs = 0; }
   if (hostChanged) what |= 4;
   if (what) scheduleNetApply(what);
   JsonDocument o; o["ok"] = true; o["apply"] = what != 0; sendDoc(o);
@@ -2246,8 +2255,7 @@ static void apiNetApPost() {
   if (d["mode"].is<int>()) { int v = d["mode"]; if (v != 0 && v != 1) { sendErr(400, "mode must be 0 or 1"); return; } a.mode = v; }
   bool changed = memcmp(&a, &netCfg.ap, sizeof(ApCfg)) != 0;
   netCfg.ap = a;
-  markDirty(D_NET);
-  if (changed) scheduleNetApply(2);
+  if (changed) { markDirty(D_NET); scheduleNetApply(2); }
   JsonDocument o; o["ok"] = true; o["apply"] = changed; o["forced"] = !staWanted(); sendDoc(o);
 }
 
@@ -2413,6 +2421,7 @@ var timers=[];
 var $=function(s,r){return (r||document).querySelector(s);};
 var $$=function(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));};
 var esc=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});};
+var attrEsc=function(s){return String(s==null?'':s).replace(/[&<>"'\x00-\x1F]/g,function(c){var m={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return m[c]||('&#'+c.charCodeAt(0)+';');});};
 var p2=function(n){return (n<10?'0':'')+n;};
 var every=function(ms,fn){timers.push(setInterval(fn,ms));};
 var api=async function(path,body,method){
@@ -2506,7 +2515,7 @@ var relays=function(){
   refresh();every(2000,refresh);
 }
 var gpio=function(){
-  var m=$('#main');m.innerHTML='<h1>GPIO</h1><div class="card"><div><button class="btn p" id="gh">Global HIGH</button><button class="btn p" id="gl">Global LOW</button><button class="btn" id="ga">All relays back to Auto</button></div><p class="hint">Set HIGH / LOW drives the physical pin level and switches that relay to manual mode (ON/OFF depends on its polarity). Remove releases the GPIO (input, relay unassigned). Changes to pin / polarity apply immediately and are saved.</p><div id="sd"></div></div><div class="card gt" style="margin-top:12px;overflow-x:auto"><table id="gt"><thead><tr><th>#</th><th>Relay</th><th>GPIO</th><th>Polarity</th><th>Level</th><th>State</th><th>Mode</th><th>Actions</th></tr></thead><tbody></tbody></table></div>';
+  var m=$('#main');m.innerHTML='<h1>GPIO</h1><div class="card"><div><button class="btn p" id="gh">Global HIGH</button><button class="btn p" id="gl">Global LOW</button><button class="btn" id="ga">All relays back to Auto</button></div><p class="hint"><b>Force ON</b> / <b>Force OFF</b> set the relay\'s logical state (State column) and switch it to manual mode; the physical pin level is derived from the Polarity column (Level column). <b>Global HIGH</b> / <b>Global LOW</b> drive the physical pin level directly on all assigned relays. Remove releases the GPIO (input, relay unassigned). Changes to pin / polarity apply immediately and are saved.</p><div id="sd"></div></div><div class="card gt" style="margin-top:12px;overflow-x:auto"><table id="gt"><thead><tr><th>#</th><th>Relay</th><th>GPIO</th><th>Polarity</th><th>Level</th><th>State</th><th>Mode</th><th>Actions</th></tr></thead><tbody></tbody></table></div>';
   var pins=[];
   var load=async function(){try{var g=await api('/api/gpio');pins=g.pins;if(g.serialDebug)$('#sd').innerHTML='<div class="warnbox">Serial debug build: GPIO1/GPIO3 are reserved for the UART and will not be driven.</div>';
     var used={};g.r.forEach(function(r){if(r.p>=0)used[r.p]=r.n;});
@@ -2514,16 +2523,19 @@ var gpio=function(){
     var lvl=function(r){return r.lv<0?'<span class="mut">-</span>':'<span class="badge '+(r.lv?'on':'off')+'">'+(r.lv?'HIGH':'LOW')+'</span>';};
     if(tb.children.length===g.r.length){
       g.r.forEach(function(r,i){var tr=tb.children[i];$('.rn',tr).textContent=r.n;$('.lv',tr).innerHTML=lvl(r);$('.st',tr).innerHTML=stBadge(r.s);$('.md',tr).textContent=modeName(r.m);
-        if(!(ae&&tr.contains(ae))){var sp=$('.pin',tr);if(String(sp.value)!==String(r.p))sp.value=String(r.p);$$('option',sp).forEach(function(o){var p=+o.value;o.disabled=p>=0&&!!used[p]&&p!==r.p;o.textContent=p<0?'none':'GPIO'+p+(o.disabled?' (used)':'');});var sa=$('.al',tr);if(sa.value!==(r.al?'1':'0'))sa.value=r.al?'1':'0';}});
+        var sp=$('.pin',tr),sa=$('.al',tr);
+        if(ae!==sp){if(String(sp.value)!==String(r.p))sp.value=String(r.p);}
+        $$('option',sp).forEach(function(o){var p=+o.value;o.disabled=p>=0&&!!used[p]&&p!==r.p;o.textContent=p<0?'none':'GPIO'+p+(o.disabled?' (used)':'');});
+        if(ae!==sa){if(sa.value!==(r.al?'1':'0'))sa.value=r.al?'1':'0';}});
       return;}
     tb.innerHTML=g.r.map(function(r,i){var opts='<option value="-1"'+(r.p<0?' selected':'')+'>none</option>'+pins.map(function(p){var u=used[p]&&p!==r.p;return '<option value="'+p+'"'+(p===r.p?' selected':'')+(u?' disabled':'')+'>GPIO'+p+(u?' (used)':'')+'</option>';}).join('');
-      return '<tr data-i="'+i+'"><td class="ix">#'+(i+1)+'</td><td class="rn" data-l="Relay">'+esc(r.n)+'</td><td data-l="GPIO"><select class="pin">'+opts+'</select></td><td data-l="Polarity"><select class="al"><option value="1"'+(r.al?' selected':'')+'>Active LOW</option><option value="0"'+(!r.al?' selected':'')+'>Active HIGH</option></select></td><td class="lv" data-l="Level">'+lvl(r)+'</td><td class="st" data-l="State">'+stBadge(r.s)+'</td><td class="md" data-l="Mode">'+modeName(r.m)+'</td><td class="ac" data-l="Actions"><button class="btn s hi">Set HIGH</button><button class="btn s lo">Set LOW</button><button class="btn s au">Auto</button><button class="btn s r rm">Remove</button></td></tr>';}).join('');
+      return '<tr data-i="'+i+'"><td class="ix">#'+(i+1)+'</td><td class="rn" data-l="Relay">'+esc(r.n)+'</td><td data-l="GPIO"><select class="pin">'+opts+'</select></td><td data-l="Polarity"><select class="al"><option value="1"'+(r.al?' selected':'')+'>Active LOW</option><option value="0"'+(!r.al?' selected':'')+'>Active HIGH</option></select></td><td class="lv" data-l="Level">'+lvl(r)+'</td><td class="st" data-l="State">'+stBadge(r.s)+'</td><td class="md" data-l="Mode">'+modeName(r.m)+'</td><td class="ac" data-l="Actions"><button class="btn s hi" title="Switch to manual mode and turn the relay ON">Force ON</button><button class="btn s lo" title="Switch to manual mode and turn the relay OFF">Force OFF</button><button class="btn s au">Auto</button><button class="btn s r rm">Remove</button></td></tr>';}).join('');
     $$('#gt tbody tr').forEach(function(tr){var i=+tr.getAttribute('data-i');
       $('.pin',tr).onchange=function(){api('/api/gpio/'+i,{pin:+this.value,al:$('.al',tr).value==='1'}).then(function(){toast('GPIO updated');load();}).catch(function(e){fail(e);load();});};
       $('.al',tr).onchange=function(){api('/api/gpio/'+i,{pin:+$('.pin',tr).value,al:this.value==='1'}).then(function(){toast('Polarity updated');load();}).catch(function(e){fail(e);load();});};
-      $('.hi',tr).onclick=function(){api('/api/gpio/'+i+'/level',{level:1}).then(load).catch(fail);};
-      $('.lo',tr).onclick=function(){api('/api/gpio/'+i+'/level',{level:0}).then(load).catch(fail);};
-      $('.au',tr).onclick=function(){setMode(i,0).then(load);};
+      $('.hi',tr).onclick=function(){api('/api/gpio/'+i+'/level',{level:1}).then(load).catch(function(e){fail(e);load();});};
+      $('.lo',tr).onclick=function(){api('/api/gpio/'+i+'/level',{level:0}).then(load).catch(function(e){fail(e);load();});};
+      $('.au',tr).onclick=function(){api('/api/relay/'+i+'/mode',{mode:0}).then(load).catch(function(e){fail(e);load();});};
       $('.rm',tr).onclick=function(){if(confirm('Unassign the GPIO of relay '+(i+1)+'?'))api('/api/gpio/'+i+'/remove',{}).then(function(){toast('GPIO removed');load();}).catch(fail);};});
   }catch(e){}}
   $('#gh').onclick=function(){if(confirm('Drive ALL assigned relay pins HIGH (manual mode)?'))api('/api/gpio/all',{level:1}).then(load).catch(fail);};
