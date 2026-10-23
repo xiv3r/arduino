@@ -2168,12 +2168,6 @@ static void apiGpioRemove() {
   sendOk();
 }
 
-static void setRelayLevel(uint8_t i, int level) {
-  bool logical = gpioCfg.activeLow[i] ? (level == LOW) : (level == HIGH);
-  relays[i].mode = logical ? 1 : 2;
-  markDirty(D_RELAY0 << i);
-}
-
 static void apiGpioLevel() {
   int i = pathIndex("/api/gpio/"); if (i < 0) { sendErr(404, "bad relay index"); return; }
   JsonDocument d; if (!readBody(d)) return;
@@ -2195,7 +2189,7 @@ static void apiGpioAll() {
   }
   int lvl = d["level"] | -1;
   if (lvl != 0 && lvl != 1) { sendErr(400, "level must be 0 or 1"); return; }
-  for (uint8_t i = 0; i < NUM_RELAYS; i++) if (gpioCfg.pin[i] >= 0) setRelayLevel(i, lvl ? HIGH : LOW);
+  for (uint8_t i = 0; i < NUM_RELAYS; i++) if (gpioCfg.pin[i] >= 0) { relays[i].mode = lvl ? 1 : 2; markDirty(D_RELAY0 << i); }
   applyOutputs(false);
   sendOk();
 }
@@ -2515,7 +2509,7 @@ var relays=function(){
   refresh();every(2000,refresh);
 }
 var gpio=function(){
-  var m=$('#main');m.innerHTML='<h1>GPIO</h1><div class="card"><div><button class="btn p" id="gh">Global HIGH</button><button class="btn p" id="gl">Global LOW</button><button class="btn" id="ga">All relays back to Auto</button></div><p class="hint"><b>Force ON</b> / <b>Force OFF</b> set the relay\'s logical state (State column) and switch it to manual mode; the physical pin level is derived from the Polarity column (Level column). <b>Global HIGH</b> / <b>Global LOW</b> drive the physical pin level directly on all assigned relays. Remove releases the GPIO (input, relay unassigned). Changes to pin / polarity apply immediately and are saved.</p><div id="sd"></div></div><div class="card gt" style="margin-top:12px;overflow-x:auto"><table id="gt"><thead><tr><th>#</th><th>Relay</th><th>GPIO</th><th>Polarity</th><th>Level</th><th>State</th><th>Mode</th><th>Actions</th></tr></thead><tbody></tbody></table></div>';
+  var m=$('#main');m.innerHTML='<h1>GPIO</h1><div class="card"><div><button class="btn p" id="gh">All ON</button><button class="btn p" id="gl">All OFF</button><button class="btn" id="ga">All relays back to Auto</button></div><p class="hint"><b>Force ON</b> / <b>Force OFF</b> and <b>All ON</b> / <b>All OFF</b> set the relay\'s logical state (State column) and switch it to manual mode; the physical pin level is derived from the Polarity column (Level column) &mdash; with Active LOW the pin goes LOW for ON, with Active HIGH the pin goes HIGH for ON. Remove releases the GPIO (input, relay unassigned). Changes to pin / polarity apply immediately and are saved.</p><div id="sd"></div></div><div class="card gt" style="margin-top:12px;overflow-x:auto"><table id="gt"><thead><tr><th>#</th><th>Relay</th><th>GPIO</th><th>Polarity</th><th>Level</th><th>State</th><th>Mode</th><th>Actions</th></tr></thead><tbody></tbody></table></div>';
   var pins=[];
   var load=async function(){try{var g=await api('/api/gpio');pins=g.pins;if(g.serialDebug)$('#sd').innerHTML='<div class="warnbox">Serial debug build: GPIO1/GPIO3 are reserved for the UART and will not be driven.</div>';
     var used={};g.r.forEach(function(r){if(r.p>=0)used[r.p]=r.n;});
@@ -2538,8 +2532,8 @@ var gpio=function(){
       $('.au',tr).onclick=function(){api('/api/relay/'+i+'/mode',{mode:0}).then(load).catch(function(e){fail(e);load();});};
       $('.rm',tr).onclick=function(){if(confirm('Unassign the GPIO of relay '+(i+1)+'?'))api('/api/gpio/'+i+'/remove',{}).then(function(){toast('GPIO removed');load();}).catch(fail);};});
   }catch(e){}}
-  $('#gh').onclick=function(){if(confirm('Drive ALL assigned relay pins HIGH (manual mode)?'))api('/api/gpio/all',{level:1}).then(load).catch(fail);};
-  $('#gl').onclick=function(){if(confirm('Drive ALL assigned relay pins LOW (manual mode)?'))api('/api/gpio/all',{level:0}).then(load).catch(fail);};
+  $('#gh').onclick=function(){if(confirm('Turn ALL assigned relays ON (manual mode)?'))api('/api/gpio/all',{level:1}).then(load).catch(fail);};
+  $('#gl').onclick=function(){if(confirm('Turn ALL assigned relays OFF (manual mode)?'))api('/api/gpio/all',{level:0}).then(load).catch(fail);};
   $('#ga').onclick=function(){api('/api/gpio/all',{auto:true}).then(function(){toast('All relays in Auto');load();}).catch(fail);};
   load();every(2000,load);
 }
