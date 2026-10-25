@@ -1,3 +1,4 @@
+
 /*
 ===============================================================================
  *  ESP32S3 16-Channel Automatic Relay Timer Switch
@@ -23,7 +24,7 @@
 Preferences preferences;
 #define NVS_NAMESPACE "relay16"
 #define EEPROM_MAGIC   0x1234
-#define EEPROM_VERSION 13
+#define EEPROM_VERSION 14
 #define EXT_CFG_MAGIC  0xEC
 #define RELAY_CONFIG_MAGIC 0x1CE5
 
@@ -49,6 +50,12 @@ static const unsigned long WIFI_CONNECT_TIMEOUT =   20000UL;
 static const unsigned long SCHEDULE_PROCESS_INTERVAL = 250UL;
 static const unsigned long RTC_REBASE_INTERVAL  =  300000UL;
 static const unsigned long DS3231_SYNC_INTERVAL =  3600000UL;
+
+// =============================================================================
+//  DST Cache Timing
+// =============================================================================
+static const unsigned long DST_CACHE_TTL_SECONDS = 5ULL;
+static const unsigned long DST_CACHE_INVALIDATE_INTERVAL = 5000UL;
 
 // =============================================================================
 //  NTP Async State Machine Constants
@@ -82,7 +89,6 @@ static bool factoryResetTriggered = false;
 //  mDNS Settings
 // =============================================================================
 #define MDNS_HOSTNAME_DEFAULT "esp32s3"
-static const unsigned long MDNS_RESTART_DELAY = 2000UL;
 
 // =============================================================================
 //  NTP Fallback Pool
@@ -112,6 +118,8 @@ RTC_DS3231 rtc;
 bool rtcPresent = false;
 unsigned long lastRTCDSync = 0;
 bool rtcTimeValid = false;
+static uint8_t rtcFailCount = 0;
+static const uint8_t RTC_FAIL_THRESHOLD = 3;
 static float         cachedRtcTemp          = NAN;
 static unsigned long lastRtcTempRead        = 0;
 static const unsigned long RTC_TEMP_READ_INTERVAL = 10000UL;
@@ -191,6 +199,10 @@ struct SystemConfig {
     int32_t  gmt_offset;
     int32_t  daylight_offset;
     uint64_t last_rtc_epoch;
+    char     tz_name[32];
+    uint8_t  tz_rule_id;
+    uint8_t  tz_auto_dst;
+    uint8_t  tz_reserved[2];
 } __attribute__((packed));
 
 struct ExtConfig {
@@ -202,6 +214,57 @@ struct ExtConfig {
     uint8_t sta_enabled;
     uint8_t reserved[26];
 } __attribute__((packed));
+
+// =============================================================================
+//  Timezone Rule Table
+// =============================================================================
+struct TZRule {
+    const char* name;
+    int32_t     std_offset;
+    int32_t     dst_offset;
+    uint8_t     dst_start_mon;
+    uint8_t     dst_start_wday;
+    uint8_t     dst_start_nth;
+    uint8_t     dst_start_mday;
+    uint8_t     dst_start_hour;
+    uint8_t     dst_start_min;
+    uint8_t     dst_end_mon;
+    uint8_t     dst_end_wday;
+    uint8_t     dst_end_nth;
+    uint8_t     dst_end_mday;
+    uint8_t     dst_end_hour;
+    uint8_t     dst_end_min;
+};
+
+static const TZRule TZ_TABLE[] = {
+    {"UTC",                       0,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Manila",           28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Tokyo",            32400,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Shanghai",         28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Kolkata",          19800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Dubai",            14400,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Singapore",        28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Hong_Kong",        28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Seoul",            32400,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Bangkok",          25200,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Australia/Sydney",      36000,   39600,    10,  0,    1,   0,  2, 0,    4,  0,    1,   0,  3, 0},
+    {"Australia/Perth",       28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Australia/Brisbane",    36000,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Europe/London",             0,    3600,     3,  0, 0xFE,   0,  1, 0,   10,  0, 0xFE,   0,  2, 0},
+    {"Europe/Paris",           3600,    7200,     3,  0, 0xFE,   0,  2, 0,   10,  0, 0xFE,   0,  3, 0},
+    {"Europe/Berlin",          3600,    7200,     3,  0, 0xFE,   0,  2, 0,   10,  0, 0xFE,   0,  3, 0},
+    {"Europe/Moscow",         10800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"America/New_York",     -18000,  -14400,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Chicago",      -21600,  -18000,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Denver",       -25200,  -21600,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Los_Angeles",  -28800,  -25200,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Sao_Paulo",    -10800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Pacific/Auckland",      43200,   46800,     9,  0, 0xFE,   0,  2, 0,    4,  0,    1,   0,  3, 0},
+    {"Pacific/Honolulu",     -36000,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Africa/Cairo",           7200,   10800,     4,  5, 0xFE,   0,  0, 0,   10,  4, 0xFE,   0, 24, 0},
+    {"Africa/Johannesburg",    7200,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+};
+static const uint8_t TZ_TABLE_SIZE = sizeof(TZ_TABLE) / sizeof(TZ_TABLE[0]);
 
 // =============================================================================
 //  Self-Healing
@@ -231,14 +294,12 @@ static unsigned long lastInternalRTCSave = 0;
 static const unsigned long INTERNAL_RTC_SAVE_INTERVAL = 3600000UL;
 
 // NTP
-uint8_t       ntpServerIndex  = 0;
 uint8_t       ntpFailCount    = 0;
 unsigned long lastNTPSync     = 0;
 unsigned long lastNTPAttempt  = 0;
 
 // NTP Async
 static uint8_t  ntpAsyncState = NTP_STATE_IDLE;
-static uint8_t  ntpAsyncCurrentServer = 0;
 static unsigned long ntpAsyncPhaseStart = 0;
 static WiFiUDP  ntpUDP;
 static uint8_t  ntpPacketBuffer[NTP_PACKET_SIZE];
@@ -255,29 +316,22 @@ unsigned long wifiGiveUpUntil       = 0;
 static const uint8_t MAX_RECONNECT  = 10;
 bool          wifiConnecting        = false;
 unsigned long wifiConnectStart      = 0;
-bool          wifiFirstAttempt      = true;
 
 // WiFi Scan
 volatile bool scanInProgress  = false;
 volatile int  scanResultCount = -1;
 unsigned long scanStartTime   = 0;
 
-// AP
-char ap_ssid[32]     = "ESP32S3_16CH_Timer_Switch";
-char ap_password[32] = "12345678";
-
 // mDNS
 bool          mdnsStarted           = false;
 char          mdnsHostname[32]      = MDNS_HOSTNAME_DEFAULT;
-unsigned long mdnsRestartPending    = 0;
-bool          mdnsRestartScheduled  = false;
 
 // =============================================================================
 //  Schedule Engine
 // =============================================================================
 static bool     scheduleActiveCache[MAX_RELAYS] = {false};
 static unsigned long lastScheduleCacheUpdate = 0;
-static const unsigned long SCHEDULE_CACHE_INTERVAL = 1000UL;
+static const unsigned long SCHEDULE_CACHE_INTERVAL = 250UL;
 static unsigned long lastScheduleProcess = 0;
 static bool lastRelayOutputs[MAX_RELAYS] = {false};
 static unsigned long lastStateChangeGlobal[MAX_RELAYS] = {0};
@@ -288,8 +342,13 @@ static bool lastDebouncedStateGlobal[MAX_RELAYS] = {false};
 // =============================================================================
 static unsigned long lastMemoryCleanup = 0;
 static unsigned long lastHeapCheck = 0;
-static size_t minFreeHeap = 0;
-static unsigned long lastConnectionActivity = 0;
+
+// =============================================================================
+//  DST Cache
+// =============================================================================
+static int32_t  cachedDstOffset = 0;
+static uint64_t cachedDstForEpoch = 0;
+static bool     cachedDstValid = false;
 
 // =============================================================================
 //  Self-Healing Class
@@ -303,9 +362,8 @@ public:
     void smartRecovery();
     void verifyRelayStates(bool force = false);
     void performTargetedRecovery();
-    void restartAPIfNeeded(bool forceRestart = false);
+    void restartAPIfNeeded(bool forceRestart);
 private:
-    unsigned long lastWebServerCheck = 0;
     unsigned long lastFullHealthCheck = 0;
     unsigned long lastWiFiReconfigure = 0;
     unsigned long lastMDNSReconfigure = 0;
@@ -361,6 +419,9 @@ void startNTPRequest(const char* server);
 void processNTPResponse();
 void updateNTPSync();
 float getRTCTemperature();
+void invalidateDstCache();
+int32_t currentDstOffset(uint64_t utcEpoch);
+uint8_t findTzByName(const char* name);
 
 // =============================================================================
 //  64-bit Conversion Helpers
@@ -420,10 +481,116 @@ struct tm* gmtime64(uint64_t* timep) {
 }
 
 // =============================================================================
+//  Timezone Helpers
+// =============================================================================
+static uint64_t daysFromYMD(uint16_t y, uint8_t m, uint8_t d) {
+    if (m <= 2) { y -= 1; m += 12; }
+    uint64_t era = y / 400;
+    uint64_t yoe = y - era * 400;
+    uint64_t doy = (153ULL * (m - 3) + 2) / 5 + d - 1;
+    uint64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static uint8_t nthWeekdayOfMonth(uint16_t year, uint8_t mon0, uint8_t wday, uint8_t nth) {
+    static const uint8_t t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+    uint16_t y = year;
+    if (mon0 < 2) y -= 1;
+    uint8_t wday1 = (uint8_t)((y + y/4 - y/100 + y/400 + t[mon0] + 1) % 7);
+    uint8_t first = (uint8_t)(((wday - wday1 + 7) % 7) + 1);
+    if (nth == 0xFE) {
+        static const uint8_t mdays[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        uint8_t dim = mdays[mon0];
+        bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+        if (mon0 == 1 && leap) dim = 29;
+        uint8_t d = first;
+        while (d + 7 <= dim) d += 7;
+        return d;
+    }
+    uint8_t d = first + (nth - 1) * 7;
+    static const uint8_t mdays2[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    uint8_t dim2 = mdays2[mon0];
+    bool leap2 = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    if (mon0 == 1 && leap2) dim2 = 29;
+    if (d > dim2) d -= 7;
+    return d;
+}
+
+static int32_t computeDstOffset(uint64_t utcEpoch, uint8_t ruleId) {
+    if (ruleId >= TZ_TABLE_SIZE) return 0;
+    const TZRule& r = TZ_TABLE[ruleId];
+    if (r.dst_offset == 0) return 0;
+
+    uint64_t localForStd = utcEpoch + (uint64_t)(int64_t)r.std_offset;
+    struct tm* p = gmtime64(&localForStd);
+    if (!p) return 0;
+    uint16_t year = (uint16_t)(p->tm_year + 1900);
+
+    uint8_t startDay = (r.dst_start_nth == 0xFF)
+        ? r.dst_start_mday
+        : nthWeekdayOfMonth(year, r.dst_start_mon - 1, r.dst_start_wday, r.dst_start_nth);
+    uint64_t startLocal = daysFromYMD(year, r.dst_start_mon, startDay) * 86400ULL
+                        + (uint64_t)r.dst_start_hour * 3600ULL
+                        + (uint64_t)r.dst_start_min * 60ULL;
+    uint64_t startUtc = startLocal - (uint64_t)(int64_t)r.std_offset;
+
+    uint8_t endDay = (r.dst_end_nth == 0xFF)
+        ? r.dst_end_mday
+        : nthWeekdayOfMonth(year, r.dst_end_mon - 1, r.dst_end_wday, r.dst_end_nth);
+    uint64_t endLocal = daysFromYMD(year, r.dst_end_mon, endDay) * 86400ULL
+                      + (uint64_t)r.dst_end_hour * 3600ULL
+                      + (uint64_t)r.dst_end_min * 60ULL;
+    uint64_t endUtc = endLocal - (uint64_t)(int64_t)r.dst_offset;
+
+    bool inDst;
+    if (startUtc < endUtc) {
+        inDst = (utcEpoch >= startUtc && utcEpoch < endUtc);
+    } else {
+        inDst = (utcEpoch >= startUtc || utcEpoch < endUtc);
+    }
+    return inDst ? (r.dst_offset - r.std_offset) : 0;
+}
+
+uint8_t findTzByName(const char* name) {
+    if (!name) return 0;
+    for (uint8_t i = 0; i < TZ_TABLE_SIZE; i++) {
+        if (strcmp(TZ_TABLE[i].name, name) == 0) return i;
+    }
+    return TZ_TABLE_SIZE;
+}
+
+void invalidateDstCache() {
+    cachedDstValid = false;
+}
+
+int32_t currentDstOffset(uint64_t utcEpoch) {
+    if (cachedDstValid && utcEpoch >= cachedDstForEpoch
+        && (utcEpoch - cachedDstForEpoch) < DST_CACHE_TTL_SECONDS) {
+        return cachedDstOffset;
+    }
+    int32_t off = 0;
+    if (sysConfig.tz_auto_dst && sysConfig.tz_rule_id < TZ_TABLE_SIZE) {
+        off = computeDstOffset(utcEpoch, sysConfig.tz_rule_id);
+    } else {
+        off = sysConfig.daylight_offset;
+    }
+    cachedDstOffset = off;
+    cachedDstForEpoch = utcEpoch;
+    cachedDstValid = true;
+    return off;
+}
+
+// =============================================================================
 //  Get Local Epoch
 // =============================================================================
 inline uint64_t getLocalEpoch(uint64_t utcEpoch) {
-    int64_t offset = (int64_t)sysConfig.gmt_offset + (int64_t)sysConfig.daylight_offset;
+    int64_t offset;
+    if (sysConfig.tz_auto_dst && sysConfig.tz_rule_id < TZ_TABLE_SIZE) {
+        const TZRule& r = TZ_TABLE[sysConfig.tz_rule_id];
+        offset = (int64_t)r.std_offset + (int64_t)currentDstOffset(utcEpoch);
+    } else {
+        offset = (int64_t)sysConfig.gmt_offset + (int64_t)sysConfig.daylight_offset;
+    }
     if (offset > 50400) offset = 50400;
     if (offset < -50400) offset = -50400;
     return utcEpoch + (uint64_t)offset;
@@ -491,14 +658,14 @@ void setWiFiStationEnabled(bool enabled) {
     saveExtConfig();
     if (!enabled) {
         ntpUDP.stop();
-        WiFi.disconnect(true);
+        WiFi.disconnect(false, false);
         wifiConnected = false;
         wifiConnecting = false;
         wifiPausedForScan = false;
         wifiReconnectAttempts = 0;
         wifiGiveUpUntil = 0;
-        if (WiFi.getMode() != WIFI_AP) {
-            WiFi.mode(WIFI_AP);
+        if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
+            WiFi.mode(WIFI_AP_STA);
         }
         ntpAsyncState = NTP_STATE_IDLE;
         ntpAsyncStage = 0;
@@ -511,7 +678,6 @@ void setWiFiStationEnabled(bool enabled) {
             WiFi.begin(sysConfig.sta_ssid, sysConfig.sta_password);
             wifiConnecting = true;
             wifiConnectStart = millis();
-            wifiFirstAttempt = true;
             wifiReconnectAttempts = 0;
             wifiGiveUpUntil = 0;
         }
@@ -531,6 +697,7 @@ void initRTC() {
     }
     rtcPresent = true;
     rtcTimeValid = false;
+    rtcFailCount = 0;
     if (rtc.lostPower()) {
         return;
     }
@@ -543,6 +710,7 @@ void initRTC() {
             driftCompensation = 1.0f;
             rtcMicrosAtLastSync = micros();
             lastRTCRebase = millis();
+            lastRTCDSync = millis();
             rtcInitialized = true;
             timeSource = TIME_SOURCE_RTC;
         }
@@ -556,6 +724,10 @@ void immediateDS3231Sync() {
             rtc.adjust(dt);
             rtcTimeValid = true;
             lastRTCDSync = millis();
+            rtcFailCount = 0;
+        } else {
+            rtcPresent = false;
+            rtcTimeValid = false;
         }
     }
 }
@@ -572,10 +744,23 @@ float getRTCTemperature() {
     lastRtcTempRead = now;
     Wire.beginTransmission(0x68);
     Wire.write(0x11);
-    if (Wire.endTransmission() != 0) return cachedRtcTemp;
-    if (Wire.requestFrom((uint8_t)0x68, (uint8_t)2) != 2) {
+    if (Wire.endTransmission() != 0) {
+        if (rtcFailCount < 255) rtcFailCount++;
+        if (rtcFailCount >= RTC_FAIL_THRESHOLD) {
+            rtcPresent = false;
+            rtcTimeValid = false;
+        }
         return cachedRtcTemp;
     }
+    if (Wire.requestFrom((uint8_t)0x68, (uint8_t)2) != 2) {
+        if (rtcFailCount < 255) rtcFailCount++;
+        if (rtcFailCount >= RTC_FAIL_THRESHOLD) {
+            rtcPresent = false;
+            rtcTimeValid = false;
+        }
+        return cachedRtcTemp;
+    }
+    rtcFailCount = 0;
     int8_t  msb = (int8_t)Wire.read();
     uint8_t lsb = Wire.read();
     cachedRtcTemp = (float)msb + ((lsb >> 6) * 0.25f);
@@ -694,6 +879,7 @@ bool loadRTCFromDS3231() {
                 driftCompensation = 1.0f;
                 rtcMicrosAtLastSync = micros();
                 lastRTCRebase = millis();
+                lastRTCDSync = millis();
                 rtcInitialized = true;
                 timeSource = TIME_SOURCE_RTC;
                 if (sysConfig.last_rtc_epoch == 0 ||
@@ -716,7 +902,7 @@ void pauseWiFiForScan() {
     if (wifiConnecting && !wifiConnected && !wifiPausedForScan && extConfig.sta_enabled) {
         wifiPausedForScan = true;
         wifiPauseUntil = millis() + WIFI_PAUSE_DURATION;
-        WiFi.disconnect(true);
+        WiFi.disconnect(false, false);
         delay(100);
         wifiConnecting = false;
         lastScanAttempt = millis();
@@ -756,7 +942,7 @@ bool SelfHealingSystem::liveReconfigureMDNS() {
             MDNS.addServiceTxt("http", "tcp", "model", "ESP32S3");
             MDNS.addServiceTxt("http", "tcp", "version", "v12");
             MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
-            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit");
+            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,tz");
             mdnsStarted = true;
         }
     } else {
@@ -788,25 +974,50 @@ bool SelfHealingSystem::liveReconfigureAP() {
 }
 
 void SelfHealingSystem::restartAPIfNeeded(bool forceRestart) {
-    if (forceRestart) {
-        WiFi.softAPdisconnect(true);
-        delay(500);
-        uint8_t ch = extConfig.ap_channel;
-        if (ch < 1 || ch > 13) ch = 6;
-        uint8_t hidden = extConfig.ap_hidden ? 1 : 0;
-        if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
-            WiFi.mode(WIFI_AP_STA);
-        }
-        bool apStarted = false;
+    if (!forceRestart) return;
+    WiFi.softAPdisconnect(true);
+    delay(500);
+    uint8_t ch = extConfig.ap_channel;
+    if (ch < 1 || ch > 13) ch = 6;
+    uint8_t hidden = extConfig.ap_hidden ? 1 : 0;
+    if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
+        WiFi.mode(WIFI_AP_STA);
+    }
+    bool apStarted = false;
+    if (strlen(sysConfig.ap_password) > 0) {
+        apStarted = WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, ch, hidden);
+    } else {
+        apStarted = WiFi.softAP(sysConfig.ap_ssid, NULL, ch, hidden);
+    }
+    if (!apStarted) {
         if (strlen(sysConfig.ap_password) > 0) {
-            apStarted = WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, ch, hidden);
+            apStarted = WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, 6, hidden);
         } else {
-            apStarted = WiFi.softAP(sysConfig.ap_ssid, NULL, ch, hidden);
+            apStarted = WiFi.softAP(sysConfig.ap_ssid, NULL, 6, hidden);
         }
-        if (apStarted) {
-            delay(100);
-            liveReconfigureMDNS();
+    }
+    if (apStarted) {
+        delay(100);
+        dnsServer.stop();
+        dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+        if (mdnsStarted) {
+            MDNS.end();
+            mdnsStarted = false;
         }
+        delay(50);  
+        if (MDNS.begin(mdnsHostname)) {
+            MDNS.addService("http", "tcp", 80);
+            MDNS.addServiceTxt("http", "tcp", "model", "ESP32S3");
+            MDNS.addServiceTxt("http", "tcp", "version", "v12");
+            MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
+            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,tz");
+            mdnsStarted = true;
+        } else {
+            mdnsStarted = false;
+        }
+        lastMDNSReconfigure = millis();
+    } else {
+        ESP.restart();
     }
 }
 
@@ -817,7 +1028,11 @@ bool SelfHealingSystem::recoverRTC() {
     if (!rtcPresent) return false;
     Wire.begin(8, 9);
     Wire.setTimeOut(50);
-    if (!rtc.begin()) return false;
+    if (!rtc.begin()) {
+        rtcPresent = false;
+        rtcTimeValid = false;
+        return false;
+    }
     if (rtcInitialized && internalEpoch > 0) {
         DateTime dt = uint64ToRtcDateTime(internalEpoch);
         rtc.adjust(dt);
@@ -924,11 +1139,9 @@ void performMemoryCleanup() {
 }
 
 void cleanupStaleResources() {
-    unsigned long now = millis();
     if (!scanInProgress && WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
         WiFi.scanDelete();
     }
-    (void)now;
     performMemoryCleanup();
 }
 
@@ -937,9 +1150,6 @@ void checkAndCleanMemory() {
     if (timeHasElapsed(now, lastHeapCheck, 300000)) {
         lastHeapCheck = now;
         size_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < minFreeHeap || minFreeHeap == 0) {
-            minFreeHeap = freeHeap;
-        }
         if (freeHeap < 20000) {
             performMemoryCleanup();
         }
@@ -957,7 +1167,6 @@ const char style_css[] PROGMEM = R"css(
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;background:#EEF2F7;color:#1A1A2E;font-size:14px;line-height:1.5}
 header{background:linear-gradient(135deg,#1565C0 0%,#0D47A1 100%);color:#fff;padding:10px 16px;display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:50;box-shadow:0 2px 10px rgba(0,0,0,.3);flex-wrap:wrap}
-.logo{font-size:13px;font-weight:700;white-space:nowrap}
 nav{display:flex;gap:3px;flex-wrap:wrap;flex:1}
 nav a{color:rgba(255,255,255,.8);text-decoration:none;padding:5px 8px;border-radius:5px;font-size:12px;transition:.15s}
 nav a:hover,nav a.cur{background:rgba(255,255,255,.2);color:#fff}
@@ -973,7 +1182,7 @@ main{max-width:1200px;margin:0 auto;padding:16px}
 .ctitle{font-weight:700;font-size:15px;cursor:pointer;transition:background .15s;padding:2px 4px;border-radius:4px}
 .ctitle:hover{background:#E3F2FD;color:#1565C0}
 .badge{padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700}
-.bon{background:#E8F5E9;color:#2E7D32}.boff{background:#FFEBEE;color:#C62828}.bman{background:#FFF3E0;color:#E65100}
+.bon{background:#E8F5E9;color:#2E7D32}.boff{background:#FFEBEE;color:#C62828}.bman{background:#FFF3E0;color:#E65100}.bman-on{background:#FFF3E0;color:#E65100;border:1px solid #FFB74D}.bman-off{background:#FBE9E7;color:#BF360C;border:1px solid #FF8A65}
 .brow{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
 .btn{border:none;padding:7px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;transition:.15s}
 .btn:hover{filter:brightness(1.1)}.btn:disabled{opacity:.5;cursor:default}
@@ -982,26 +1191,29 @@ main{max-width:1200px;margin:0 auto;padding:16px}
 .bsync{background:#FB8C00;color:#fff}.bdanger{background:#B71C1C;color:#fff}.bwarn{background:#F9A825;color:#212121}
 .bscan{background:#0288D1;color:#fff}
 .slist{display:flex;flex-direction:column;gap:6px;margin-bottom:8px;max-height:500px;overflow-y:auto;padding-right:2px}
-.si{border:1px solid #E3E8EF;border-radius:7px;padding:9px}
+.si{border:1px solid #E3E8EF;border-radius:7px;padding:9px;min-height:auto;height:auto;overflow:visible}
 .si.act{border-color:#90CAF9;background:#F0F7FF}
-.shdr{display:flex;align-items:center;gap:7px;margin-bottom:7px;font-size:11px;font-weight:700;color:#607D8B;text-transform:uppercase}
-.shdr label{display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;font-weight:700;color:#1A1A2E;text-transform:none}
+.shdr{display:flex;align-items:flex-start;gap:7px;margin-bottom:7px;font-size:11px;font-weight:700;color:#607D8B;text-transform:uppercase;flex-wrap:wrap}
+.shdr label{display:flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;font-weight:700;color:#1A1A2E;text-transform:none;white-space:nowrap}
 .trow{display:flex;align-items:center;gap:8px;font-size:12px;margin-top:5px}
 .trow .l{color:#90A4AE;font-weight:600;width:32px;flex-shrink:0}
 .days{display:flex;gap:3px;margin-top:5px;flex-wrap:wrap}
-.day{width:28px;height:24px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none}
+.day{width:36px;height:36px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none;padding:0;font-family:inherit;color:#1A1A2E;-webkit-appearance:none;appearance:none}
 .day:hover{border-color:#90CAF9;background:#E3F2FD}
 .day.on{background:#1565C0;color:#fff;border-color:#1565C0}
+.day:focus-visible{outline:2px solid #1565C0;outline-offset:2px}
 .mdays{display:flex;gap:2px;margin-top:5px;flex-wrap:wrap}
-.mday{width:26px;height:22px;border-radius:3px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none}
+.mday{width:32px;height:32px;border-radius:3px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none;padding:0;font-family:inherit;color:#1A1A2E;-webkit-appearance:none;appearance:none}
 .mday:hover{border-color:#90CAF9;background:#E3F2FD}
 .mday.on{background:#1565C0;color:#fff;border-color:#1565C0}
+.mday:focus-visible{outline:2px solid #1565C0;outline-offset:2px}
 .months{display:flex;gap:3px;margin-top:5px;flex-wrap:wrap}
-.month{width:36px;height:24px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none}
+.month{width:44px;height:36px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none;padding:0;font-family:inherit;color:#1A1A2E;-webkit-appearance:none;appearance:none}
 .month:hover{border-color:#90CAF9;background:#E3F2FD}
 .month.on{background:#1565C0;color:#fff;border-color:#1565C0}
+.month:focus-visible{outline:2px solid #1565C0;outline-offset:2px}
 .sched-section{margin-top:4px;font-size:10px;font-weight:600;color:#90A4AE;text-transform:uppercase;margin-bottom:2px}
-.night{font-size:10px;color:#0D47A1;background:#E3F2FD;padding:2px 6px;border-radius:4px;margin-left:auto}
+.night{font-size:10px;color:#0D47A1;background:#E3F2FD;padding:2px 6px;border-radius:4px;margin-left:auto;white-space:normal;word-break:break-word;max-width:100%;line-height:1.4;flex:1 1 auto;text-align:right}
 .night.always{background:#E8F5E9;color:#2E7D32}
 input[type=time]{flex:1;padding:5px 8px;border:1px solid #CFD8DC;border-radius:5px;font-size:13px;font-family:monospace;background:#FAFAFA;cursor:pointer;min-width:0}
 input[type=time]:focus{outline:none;border-color:#1565C0;box-shadow:0 0 0 3px rgba(21,101,192,.15);background:#fff}
@@ -1033,14 +1245,14 @@ hr{border:none;border-top:1px solid #ECEFF1;margin:14px 0}
 #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);background:#323232;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;transition:transform .28s;z-index:999;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.3);min-width:180px;text-align:center}
 #toast.show{transform:translateX(-50%) translateY(0)}
 #toast.ok{background:#2E7D32}#toast.er{background:#C62828}
-@media(max-width:500px){.grid{grid-template-columns:1fr}.ibar{grid-template-columns:1fr}.input-row{flex-direction:column}.day{width:24px;height:22px;font-size:10px}.mday{width:22px;height:20px;font-size:9px}.month{width:30px;height:22px;font-size:9px}}
+@media(max-width:500px){.grid{grid-template-columns:1fr}.ibar{grid-template-columns:1fr}.input-row{flex-direction:column}.day{width:34px;height:34px;font-size:10px}.mday{width:30px;height:30px;font-size:9px}.month{width:40px;height:34px;font-size:9px}}
 )css";
 
 // =============================================================================
-//  INDEX PAGES
+//  INDEX PAGE
 // =============================================================================
 const char index_html[] PROGMEM = R"raw(<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Relays</title>
 <link rel="stylesheet" href="/style.css"></head><body>
 <header>
@@ -1052,7 +1264,7 @@ const char index_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/gpio">GPIO</a>
 <a href="/system">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">Relay Controls &amp; Schedules</p>
@@ -1062,15 +1274,69 @@ const char index_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <script>
 const D=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+
+function toast(m,ok=true){
+  const t=document.getElementById('toast');
+  if(!t) return;
+  t.textContent=m;
+  t.className='show '+(ok?'ok':'er');
+  clearTimeout(t._t);
+  t._t=setTimeout(()=>t.className='',3000);
+}
+
+function fetchWithTimeout(url, options = {}, timeout = 10000) {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const opts = Object.assign({}, options, {signal: signal});
+  return fetch(url, opts).then(
+    response => { clearTimeout(timer); return response; },
+    error => { clearTimeout(timer); throw error; }
+  );
+}
+
+function tick(){
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetchWithTimeout('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+    tick._inflight = false;
+    if(!d || typeof d !== 'object') return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = (typeof d.time === 'string' && d.time) ? d.time : '--:--:--';
+    const de = document.getElementById('date');
+    if(de){
+      const wk = (typeof d.weekday === 'string' && d.weekday) ? d.weekday + ' ' : '';
+      const dt = (typeof d.date === 'string' && d.date) ? d.date : '--/--/----';
+      de.textContent = wk + dt;
+    }
+    const w=document.querySelector('.wd'),t=document.querySelector('.td');
+    if(w)w.className='dot '+(d.wifi?'g':'r');
+    if(t){
+      let tc='y';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth==='ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth==='browser')tc='y';
+      else if(auth==='ds3231')tc='g';
+      else if(auth==='internal_rtc')tc='y';
+      else if(auth==='rtc')tc=(d.rtcPresent === true) ? 'g' : 'y';
+      else tc='y';
+      t.className='dot '+tc;
+    }
+  }).catch(()=>{ tick._inflight = false; });
+}
 setInterval(tick,1000);tick();
 
 const NS=8;
-let relays=[],busy=false;
+let relays=[],busyCount=0;
+let loadInFlight = false;
+let pendingLoad = false;
 let editingRelay = -1;
 let editingInput = null;
 let editSuppressBlur = false;
+let savingRelays = {};
+let nameEditSeq = {};
 
 function escapeHtml(text) {
   const div = document.createElement('div');
@@ -1078,84 +1344,158 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function utf8ByteLen(str){
+  if(typeof str !== 'string') return 0;
+  try {
+    if(typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str).length;
+  } catch(e) {}
+  let n = 0;
+  for(let i = 0; i < str.length; i++){
+    const c = str.charCodeAt(i);
+    if(c < 0x80) n += 1;
+    else if(c < 0x800) n += 2;
+    else if(c >= 0xD800 && c <= 0xDBFF) { n += 4; i++; }
+    else n += 3;
+  }
+  return n;
+}
+
+function clampUtf8Bytes(str, maxBytes){
+  if(typeof str !== 'string') return '';
+  if(maxBytes <= 0) return '';
+  let bytes = 0;
+  let out = '';
+  for(let i = 0; i < str.length; i++){
+    const c = str.charCodeAt(i);
+    let step;
+    if(c < 0x80){ step = 1; }
+    else if(c < 0x800){ step = 2; }
+    else if(c >= 0xD800 && c <= 0xDBFF){
+      if(i + 1 < str.length){
+        const c2 = str.charCodeAt(i + 1);
+        if(c2 >= 0xDC00 && c2 <= 0xDFFF){ step = 4; }
+        else { step = 3; }
+      } else { step = 3; }
+    } else { step = 3; }
+    if(bytes + step > maxBytes) break;
+    bytes += step;
+    if(step === 4){ out += str[i] + str[i+1]; i++; }
+    else out += str[i];
+  }
+  return out;
+}
+
+function requestLoad(){
+  if(busyCount > 0){ pendingLoad = true; return; }
+  load();
+}
+
 function load(){
-  if(busy)return;
-  fetch('/api/relays').then(r=>r.json()).then(d=>{
-    if(!Array.isArray(d)){toast('Load error',false);return;}
+  if(busyCount > 0) return;
+  if(loadInFlight) return;
+  loadInFlight = true;
+  const g = document.getElementById('grid');
+  fetchWithTimeout('/api/relays').then(r=>r.json()).then(d=>{
+    loadInFlight = false;
+    if(!Array.isArray(d)){toast('Load error',false);if(g && (!Array.isArray(relays) || relays.length === 0))g.innerHTML='';return;}
     d=d.filter(r=>r&&typeof r==='object');
     d.forEach(r=>{
       if(!Array.isArray(r.schedules))r.schedules=[];
       r.schedules=r.schedules.filter(s=>s&&typeof s==='object');
-      r.schedules.forEach(s=>{
-        if(s.monthDays === 0x7FFFFFFF || s.monthDays === 0xFFFFFFFF) s.monthDays = 0;
-      });
-      while(r.schedules.length<NS)r.schedules.push({startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0,monthMask:0x0FFF});
+      if(r.schedules.length > NS) r.schedules = r.schedules.slice(0, NS);
+      while(r.schedules.length<NS)r.schedules.push({startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF});
     });
     relays=d;render();
-  }).catch(()=>toast('Load error',false));
+  }).catch(()=>{
+    loadInFlight = false;
+    toast('Load error',false);
+    if(g && (!Array.isArray(relays) || relays.length === 0)) g.innerHTML='';
+  });
 }
 
 function toTS(h,m,s){return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
 function fromTS(v){const p=(v||'00:00:00').split(':');return{h:parseInt(p[0])||0,m:parseInt(p[1])||0,s:parseInt(p[2])||0};}
 
 function dayMaskToStr(d){
+  if(d === undefined || d === null) d = 0x7F;
+  d = d & 0x7F;
   if(d===0x7F) return 'Everyday';
+  if(d===0) return 'None';
   let s='';
   for(let i=0;i<7;i++) if(d&(1<<i)) s+=D[i]+' ';
   return s.trim()||'None';
 }
 
 function monthDayMaskToStr(md){
-  if(md===0) return '';
-  if(md===0xFFFFFFFF) return 'All month days';
-  if(md===0x7FFFFFFF) return '';
+  let v = (md === undefined || md === null) ? 0x7FFFFFFF : md;
+  v = v & 0x7FFFFFFF;
+  if(v === 0) return 'None';
+  if(v === 0x7FFFFFFF) return 'All month days';
   let s='';
-  for(let i=0;i<31;i++) if(md&(1<<i)) s+=(i+1)+',';
+  for(let i=0;i<31;i++) if(v&(1<<i)) s+=(i+1)+',';
   return s.replace(/,$/,'')||'None';
 }
 
-function monthMaskToStr(mm) {  
+function monthMaskToStr(mm) {
+  if (mm === undefined || mm === null) return '';
+  mm = mm & 0x0FFF;
   if (mm === 0x0FFF) return 'All months';
-  if (mm === 0 || mm === undefined || mm === null) return '';
+  if (mm === 0) return 'None';
   let s='';
   for(let i=0;i<12;i++) if(mm&(1<<i)) s+=M[i]+' ';
   return s.trim()||'None';
 }
 
 function nightBadge(sc){
-  if(!sc.enabled)return'';
-  const a=sc.startHour*3600+sc.startMinute*60+sc.startSecond;
-  const b=sc.stopHour*3600+sc.stopMinute*60+sc.stopSecond;
-  const ds=dayMaskToStr(sc.days === undefined ? 0x7F : sc.days);
-  const ms=monthDayMaskToStr(sc.monthDays === undefined ? 0 : sc.monthDays);
-  const mm=monthMaskToStr(sc.monthMask === undefined ? 0x0FFF : sc.monthMask);  
-  let info=ds;
-  if(ms) info+=' | Days:'+ms;
-  if(mm && mm!=='All months') info+=' | Months:'+mm;  
-  if(a===b)return'<span class="night always">&#x25CF; Always ON ('+info+')</span>';
-  if(a>b) return'<span class="night">&#x1F319; Overnight ('+info+')</span>';
-  return'<span class="night">&#x1F319; '+info+'</span>';
+  if(!sc) return '';
+  if(!sc.enabled) return '';
+  const sh = (typeof sc.startHour === 'number') ? sc.startHour : 0;
+  const sm = (typeof sc.startMinute === 'number') ? sc.startMinute : 0;
+  const ss = (typeof sc.startSecond === 'number') ? sc.startSecond : 0;
+  const eh = (typeof sc.stopHour === 'number') ? sc.stopHour : 0;
+  const em = (typeof sc.stopMinute === 'number') ? sc.stopMinute : 0;
+  const es = (typeof sc.stopSecond === 'number') ? sc.stopSecond : 0;
+  const a = sh*3600 + sm*60 + ss;
+  const b = eh*3600 + em*60 + es;
+  const ds = dayMaskToStr(sc.days);
+  const ms = monthDayMaskToStr(sc.monthDays);
+  const mm = monthMaskToStr(sc.monthMask);
+  let parts=[];
+  if(ds === 'None') parts.push('No days');
+  else if(ds) parts.push(ds);
+  if(ms && ms!=='All month days') parts.push('Days: '+ms);
+  if(mm && mm!=='All months') parts.push('Months: '+mm);
+  let info = parts.join(' | ');
+  if(!info) info = 'Always';
+  if(a===b) return '<span class="night always">&#x25CF; Always ON ('+info+')</span>';
+  if(a>b) return '<span class="night">&#x1F319; Overnight ('+info+')</span>';
+  return '<span class="night">&#x1F319; '+info+'</span>';
 }
 
 function startEditName(relayIdx) {
+  if(!relays[relayIdx] || typeof relays[relayIdx] !== 'object') return;
+  if (editingRelay === relayIdx) {
+    if (editingInput) { editingInput.focus(); editingInput.select(); }
+    return;
+  }
   if (editingRelay !== -1) cancelEdit();
-  
   const nameSpan = document.getElementById('name_' + relayIdx);
   if (!nameSpan) return;
-  
   const currentName = relays[relayIdx].name || ('Relay ' + (relayIdx + 1));
-  
   const input = document.createElement('input');
   input.type = 'text';
   input.value = currentName;
   input.maxLength = 15;
   input.style.cssText = 'font-size:15px;font-weight:700;padding:2px 6px;border:1px solid #1565C0;border-radius:5px;width:120px;background:#fff;color:#1A1A2E;';
-  input.id = 'edit_' + relayIdx;
-  
   input.onblur = () => {
     if (editSuppressBlur) return;
     saveNameEdit(relayIdx, input.value);
   };
+  input.addEventListener('input', () => {
+    if(utf8ByteLen(input.value) > 15){
+      input.value = clampUtf8Bytes(input.value, 15);
+    }
+  });
   input.onkeydown = (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -1169,10 +1509,8 @@ function startEditName(relayIdx) {
       editSuppressBlur = false;
     }
   };
-  
   nameSpan.style.display = 'none';
   nameSpan.parentNode.insertBefore(input, nameSpan.nextSibling);
-  
   editingRelay = relayIdx;
   editingInput = input;
   input.focus();
@@ -1192,13 +1530,23 @@ function cancelEdit() {
 }
 
 function saveNameEdit(relayIdx, newName) {
+  if(!relays[relayIdx] || typeof relays[relayIdx] !== 'object'){
+    if(editingRelay === relayIdx){ editingRelay = -1; editingInput = null; }
+    return;
+  }
+  if(typeof newName !== 'string') newName = '';
   newName = newName.trim();
+  if(utf8ByteLen(newName) > 15){
+    newName = clampUtf8Bytes(newName, 15).trim();
+  }
+  while(newName.length > 0 && utf8ByteLen(newName) > 15){
+    newName = newName.slice(0, -1).trim();
+  }
   if (newName.length === 0) {
     newName = 'Relay ' + (relayIdx + 1);
   }
-  
   const nameSpan = document.getElementById('name_' + relayIdx);
-  
+  const oldName = relays[relayIdx].name || ('Relay ' + (relayIdx + 1));
   relays[relayIdx].name = newName;
   if (nameSpan) {
     nameSpan.textContent = newName;
@@ -1209,51 +1557,67 @@ function saveNameEdit(relayIdx, newName) {
   editSuppressBlur = false;
   editingRelay = -1;
   editingInput = null;
-  
-  fetch('/api/relay/name', {
+  const mySeq = (nameEditSeq[relayIdx] || 0) + 1;
+  nameEditSeq[relayIdx] = mySeq;
+  fetchWithTimeout('/api/relay/name', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({relay: relayIdx, name: newName})
   })
   .then(r => r.json())
   .then(d => {
-    if (d.success) {
+    if (nameEditSeq[relayIdx] !== mySeq) return;
+    if (d && d.success) {
       toast('Name saved!');
     } else {
+      relays[relayIdx].name = oldName;
+      const span = document.getElementById('name_' + relayIdx);
+      if (span) span.textContent = oldName;
       toast('Failed to save name', false);
     }
   })
-  .catch(() => toast('Error saving name', false));
+  .catch(() => {
+    if (nameEditSeq[relayIdx] !== mySeq) return;
+    relays[relayIdx].name = oldName;
+    const span = document.getElementById('name_' + relayIdx);
+    if (span) span.textContent = oldName;
+    toast('Error saving name', false);
+  });
 }
 
 function render(){
-  const g=document.getElementById('grid');
+  const g = document.getElementById('grid');
+  if(!g) return;
   g.innerHTML='';
-  if (!relays || relays.length === 0) {
+  if (!Array.isArray(relays) || relays.length === 0) {
     g.innerHTML = '<div class="card" style="text-align:center;padding:40px"><p style="color:#90A4AE">No relays configured. <a href="/gpio" style="color:#1565C0">Configure GPIO pins</a></p></div>';
     return;
   }
   relays.forEach((r,i)=>{
-    const sl=r.manual?'MANUAL':r.state?'ON':'OFF';
-    const sc=r.manual?'bman':r.state?'bon':'boff';
+    if(!r || typeof r !== 'object'){
+      r = {state:false, manual:false, name:'Relay '+(i+1), schedules:[]};
+      relays[i] = r;
+    }
+    const sl = r.manual ? (r.state ? 'MANUAL ON' : 'MANUAL OFF') : (r.state ? 'ON' : 'OFF');
+    const sc = r.manual ? (r.state ? 'bman-on' : 'bman-off') : (r.state ? 'bon' : 'boff');
     const displayName = r.name || ('Relay '+(i+1));
-    let html=`<div class="card">
+    let html = `<div class="card">
 <div class="card-hdr">
 <span class="ctitle" id="name_${i}" ondblclick="startEditName(${i})" title="Double-click to rename">${escapeHtml(displayName)}</span>
 <span class="badge ${sc}">${sl}</span>
 </div>
 <div class="brow">
-<button class="btn bon-b" onclick="mc(${i},true)">ON</button>
-<button class="btn boff-b" onclick="mc(${i},false)">OFF</button>
-<button class="btn baut" onclick="ra(${i})">Auto</button>
+<button type="button" class="btn bon-b" onclick="mc(${i},true)">ON</button>
+<button type="button" class="btn boff-b" onclick="mc(${i},false)">OFF</button>
+<button type="button" class="btn baut" onclick="ra(${i})">Auto</button>
 </div>
 <div class="slist">`;
     for(let s=0;s<NS;s++){
-      const sc2=r.schedules[s]||{startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0,monthMask:0x0FFF};
+      const sc2 = r.schedules[s] || {startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF};
       const dayBits = (sc2.days === undefined || sc2.days === null) ? 0x7F : sc2.days;
-      const rawMonthDayBits = (sc2.monthDays === undefined || sc2.monthDays === null) ? 0 : sc2.monthDays;
-      const monthDayBits = (rawMonthDayBits === 0x7FFFFFFF || rawMonthDayBits === 0xFFFFFFFF) ? 0 : rawMonthDayBits;
-      const monthMask = (sc2.monthMask === undefined || sc2.monthMask === null) ? 0x0FFF : sc2.monthMask;  
+      const rawMonthDayBits = (sc2.monthDays === undefined || sc2.monthDays === null) ? 0x7FFFFFFF : sc2.monthDays;
+      const monthDayBits = rawMonthDayBits & 0x7FFFFFFF;
+      const monthMask = (sc2.monthMask === undefined || sc2.monthMask === null) ? 0x0FFF : sc2.monthMask;
       html+=`<div class="si${sc2.enabled?' act':''}" id="si_${i}_${s}">
 <div class="shdr">
 <label><input type="checkbox" id="en_${i}_${s}" ${sc2.enabled?'checked':''} onchange="uf(${i},${s},'en',this.checked)"> Sched ${s+1}</label>
@@ -1269,99 +1633,189 @@ function render(){
 <div class="days" id="day_${i}_${s}">`;
       for(let d=0;d<7;d++){
         const mask = 1<<d;
-        html+=`<div class="day${(dayBits&mask)?' on':''}" onclick="toggleDay(${i},${s},${d})">${D[d]}</div>`;
+        html+=`<button type="button" class="day${(dayBits&mask)?' on':''}" onclick="toggleDay(${i},${s},${d})" aria-pressed="${(dayBits&mask)?'true':'false'}" aria-label="${D[d]}">${D[d]}</button>`;
       }
       html+=`</div>
 <div class="sched-section">Days of Month</div>
 <div class="mdays" id="mday_${i}_${s}">`;
       for(let d=0;d<31;d++){
         const mask = 1<<d;
-        html+=`<div class="mday${(monthDayBits&mask)?' on':''}" onclick="toggleMonthDay(${i},${s},${d})" title="Day ${d+1}">${d+1}</div>`;
+        html+=`<button type="button" class="mday${(monthDayBits&mask)?' on':''}" onclick="toggleMonthDay(${i},${s},${d})" title="Day ${d+1}" aria-pressed="${(monthDayBits&mask)?'true':'false'}" aria-label="Day ${d+1}">${d+1}</button>`;
       }
       html+=`</div>
 <div class="sched-section">Months of Year</div>
 <div class="months" id="mon_${i}_${s}">`;
       for(let m=0;m<12;m++){
         const mask = 1<<m;
-        html+=`<div class="month${(monthMask&mask)?' on':''}" onclick="toggleMonth(${i},${s},${m})">${M[m]}</div>`;
+        html+=`<button type="button" class="month${(monthMask&mask)?' on':''}" onclick="toggleMonth(${i},${s},${m})" aria-pressed="${(monthMask&mask)?'true':'false'}" aria-label="${M[m]}">${M[m]}</button>`;
       }
       html+=`</div>
 </div>`;
     }
-    html+=`</div><button class="btn bsave" onclick="save(${i})">&#x1F4BE; Save ${escapeHtml(displayName)}</button></div>`;
+    html+=`</div><button type="button" class="btn bsave" onclick="save(${i})">&#x1F4BE; Save ${escapeHtml(displayName)}</button></div>`;
     const el=document.createElement('div');
     el.innerHTML=html;
-    g.appendChild(el.firstChild);
+    while (el.firstChild) g.appendChild(el.firstChild);
   });
 }
 
 function toggleDay(ri,si,dayIdx){
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc = relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object') return;
   const mask = 1<<dayIdx;
-  let cur = relays[ri].schedules[si].days;
+  let cur = sc.days;
   if(cur === undefined || cur === null) cur = 0x7F;
-  cur ^= mask;
-  relays[ri].schedules[si].days = cur;
-  const dayEl = document.getElementById('day_'+ri+'_'+si).children[dayIdx];
-  if(dayEl) dayEl.className = 'day' + ((cur & mask)?' on':'');
+  cur = (cur & 0x7F) ^ mask;
+  sc.days = cur;
+  const dayEl = document.getElementById('day_'+ri+'_'+si);
+  if(dayEl && dayEl.children[dayIdx]){
+    const c = dayEl.children[dayIdx];
+    c.className = 'day' + ((cur & mask)?' on':'');
+    c.setAttribute('aria-pressed', (cur & mask) ? 'true' : 'false');
+  }
   const nb=document.getElementById('nb_'+ri+'_'+si);
-  if(nb)nb.innerHTML=nightBadge(relays[ri].schedules[si]);
+  if(nb)nb.innerHTML=nightBadge(sc);
 }
 
 function toggleMonthDay(ri,si,dayIdx){
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc = relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object') return;
   const mask = 1<<dayIdx;
-  let cur = relays[ri].schedules[si].monthDays || 0;
-  if(cur === 0x7FFFFFFF || cur === 0xFFFFFFFF) cur = 0;
+  let cur = sc.monthDays;
+  if(cur === undefined || cur === null) cur = 0x7FFFFFFF;
+  cur = cur & 0x7FFFFFFF;
   cur ^= mask;
-  relays[ri].schedules[si].monthDays = cur;
-  const mdayEl = document.getElementById('mday_'+ri+'_'+si).children[dayIdx];
-  if(mdayEl) mdayEl.className = 'mday' + ((cur & mask)?' on':'');
+  sc.monthDays = cur;
+  const mdayEl = document.getElementById('mday_'+ri+'_'+si);
+  if(mdayEl && mdayEl.children[dayIdx]){
+    const c = mdayEl.children[dayIdx];
+    c.className = 'mday' + ((cur & mask)?' on':'');
+    c.setAttribute('aria-pressed', (cur & mask) ? 'true' : 'false');
+  }
   const nb=document.getElementById('nb_'+ri+'_'+si);
-  if(nb)nb.innerHTML=nightBadge(relays[ri].schedules[si]);
+  if(nb)nb.innerHTML=nightBadge(sc);
 }
 
-function toggleMonth(ri,si,mIdx){  
+function toggleMonth(ri,si,mIdx){
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc = relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object') return;
   const mask = 1<<mIdx;
-  let cur = relays[ri].schedules[si].monthMask;
+  let cur = sc.monthMask;
   if(cur === undefined || cur === null) cur = 0x0FFF;
+  cur = cur & 0x0FFF;
   cur ^= mask;
-  relays[ri].schedules[si].monthMask = cur;
-  const monEl = document.getElementById('mon_'+ri+'_'+si).children[mIdx];
-  if(monEl) monEl.className = 'month' + ((cur & mask)?' on':'');
+  sc.monthMask = cur;
+  const monEl = document.getElementById('mon_'+ri+'_'+si);
+  if(monEl && monEl.children[mIdx]){
+    const c = monEl.children[mIdx];
+    c.className = 'month' + ((cur & mask)?' on':'');
+    c.setAttribute('aria-pressed', (cur & mask) ? 'true' : 'false');
+  }
   const nb=document.getElementById('nb_'+ri+'_'+si);
-  if(nb)nb.innerHTML=nightBadge(relays[ri].schedules[si]);
+  if(nb)nb.innerHTML=nightBadge(sc);
 }
 
 function uf(ri,si,field,val){
-  const sc=relays[ri].schedules[si];
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc=relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object'){
+    sc={startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF};
+    relays[ri].schedules[si] = sc;
+  }
   if(field==='en'){
-    sc.enabled=val;
-    const el=document.getElementById('si_'+ri+'_'+si);
-    if(el)el.className='si'+(val?' act':'');
+    sc.enabled = !!val;
+    const el = document.getElementById('si_'+ri+'_'+si);
+    if(el) el.className = 'si' + (val?' act':'');
   }else if(field==='start'){
     const t=fromTS(val);sc.startHour=t.h;sc.startMinute=t.m;sc.startSecond=t.s;
   }else if(field==='stop'){
     const t=fromTS(val);sc.stopHour=t.h;sc.stopMinute=t.m;sc.stopSecond=t.s;
   }
   const nb=document.getElementById('nb_'+ri+'_'+si);
-  if(nb)nb.innerHTML=nightBadge(sc);
+  if(nb) nb.innerHTML = nightBadge(sc);
 }
 
 function mc(ri,state){
-  fetch('/api/relay/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,state})})
-  .then(r=>r.json()).then(d=>{if(d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' '+(state?'ON':'OFF'));load();}else toast('Failed',false);})
-  .catch(()=>toast('Error',false));
+  if(!relays[ri]) return;
+  fetchWithTimeout('/api/relay/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,state:!!state})})
+  .then(r=>r.json()).then(d=>{
+    if(d && d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' '+(state?'ON':'OFF'));requestLoad();}
+    else toast('Failed',false);
+  }).catch(()=>toast('Error',false));
 }
+
 function ra(ri){
-  fetch('/api/relay/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri})})
-  .then(r=>r.json()).then(d=>{if(d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' \u2192 Auto');load();}else toast('Failed',false);})
-  .catch(()=>toast('Error',false));
+  if(!relays[ri]) return;
+  fetchWithTimeout('/api/relay/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri})})
+  .then(r=>r.json()).then(d=>{
+    if(d && d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' \u2192 Auto');requestLoad();}
+    else toast('Failed',false);
+  }).catch(()=>toast('Error',false));
 }
+
 function save(ri){
-  busy=true;
-  fetch('/api/relay/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,schedules:relays[ri].schedules})})
-  .then(r=>r.json()).then(d=>{busy=false;if(d.success)toast((relays[ri].name||('Relay '+(ri+1)))+' saved!');else toast('Save failed',false);})
-  .catch(()=>{busy=false;toast('Error',false);});
+  if(!relays[ri]) return;
+  if(savingRelays[ri]) return;
+  savingRelays[ri] = true;
+  busyCount++;
+  const btn = document.querySelector(`button[onclick="save(${ri})"]`);
+  if(btn){ btn.disabled = true; btn.textContent = 'Saving...'; }
+  const safeName = escapeHtml((relays[ri] && relays[ri].name) || ('Relay '+(ri+1)));
+  const srcSchedules = (Array.isArray(relays[ri].schedules) ? relays[ri].schedules : []).slice(0, NS);
+  const payloadSchedules = srcSchedules.map(function(s){
+    s = s || {};
+    const clampInt = (v, lo, hi, dflt) => {
+      const n = parseInt(v, 10);
+      if(isNaN(n)) return dflt;
+      return Math.max(lo, Math.min(hi, n));
+    };
+    return {
+      startHour:   clampInt(s.startHour,   0, 23, 0),
+      startMinute: clampInt(s.startMinute, 0, 59, 0),
+      startSecond: clampInt(s.startSecond, 0, 59, 0),
+      stopHour:    clampInt(s.stopHour,    0, 23, 0),
+      stopMinute:  clampInt(s.stopMinute,  0, 59, 0),
+      stopSecond:  clampInt(s.stopSecond,  0, 59, 0),
+      enabled:     !!s.enabled,
+      days:        ((typeof s.days === 'number' ? s.days : 0x7F) & 0x7F),
+      monthDays:   ((typeof s.monthDays === 'number' ? s.monthDays : 0x7FFFFFFF) & 0x7FFFFFFF),
+      monthMask:   ((typeof s.monthMask === 'number' ? s.monthMask : 0x0FFF) & 0x0FFF)
+    };
+  });
+  while(payloadSchedules.length < NS){
+    payloadSchedules.push({
+      startHour:0, startMinute:0, startSecond:0,
+      stopHour:0, stopMinute:0, stopSecond:0,
+      enabled:false, days:0x7F, monthDays:0x7FFFFFFF, monthMask:0x0FFF
+    });
+  }
+  fetchWithTimeout('/api/relay/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,schedules:payloadSchedules})})
+  .then(r=>r.json()).then(d=>{
+    savingRelays[ri] = false;
+    if(busyCount > 0) busyCount--;
+    if(btn){
+      btn.disabled = false;
+      btn.innerHTML = '&#x1F4BE; Save ' + safeName;
+    }
+    if(busyCount === 0 && pendingLoad){ pendingLoad = false; load(); }
+    if(d && d.success) toast((relays[ri].name||('Relay '+(ri+1)))+' saved!');
+    else toast('Save failed',false);
+  })
+  .catch(()=>{
+    savingRelays[ri] = false;
+    if(busyCount > 0) busyCount--;
+    if(btn){
+      btn.disabled = false;
+      btn.innerHTML = '&#x1F4BE; Save ' + safeName;
+    }
+    if(busyCount === 0 && pendingLoad){ pendingLoad = false; load(); }
+    toast('Error',false);
+  });
 }
+
 load();
 </script></body></html>)raw";
 
@@ -1381,7 +1835,7 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/gpio">GPIO</a>
 <a href="/system">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">WiFi Station Settings</p>
@@ -1434,26 +1888,96 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 }
 </style>
 <script>
-function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function toast(m,ok=true){
+  const t = document.getElementById('toast');
+  if(!t) return;
+  t.textContent = (typeof m === 'string') ? m : String(m == null ? '' : m);
+  t.className = 'show ' + (ok ? 'ok' : 'er');
+  clearTimeout(t._t);
+  t._t = setTimeout(()=>{ t.className = ''; }, 3000);
+}
+
+function fetchWithTimeout(url, options, timeout){
+  options = options || {};
+  timeout = timeout || 10000;
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), timeout);
+  const opts = Object.assign({}, options, {signal: controller.signal});
+  return fetch(url, opts).then(
+    r => { clearTimeout(timer); return r; },
+    e => { clearTimeout(timer); throw e; }
+  );
+}
+
+function tick(){
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetchWithTimeout('/api/time', {}, 8000).then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    tick._inflight = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = d.time || '--:--:--';
+    const de = document.getElementById('date');
+    if(de) de.textContent = (d.weekday ? d.weekday + ' ' : '') + (d.date || '--/--/----');
+    const w = document.querySelector('.wd');
+    const t = document.querySelector('.td');
+    if(w) w.className = 'dot ' + (d.wifi ? 'g' : 'r');
+    if(t){
+      let tc = 'y';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth === 'ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth === 'browser') tc = 'y';
+      else if(auth === 'ds3231') tc = 'g';
+      else if(auth === 'internal_rtc') tc = 'y';
+      else if(auth === 'rtc') tc = (d.rtcPresent === true) ? 'g' : 'y';
+      else tc = 'y';
+      t.className = 'dot ' + tc;
+    }
+  }).catch(()=>{ tick._inflight = false; });
+}
 setInterval(tick,1000);tick();
 
 function updateStaButton(enabled) {
     const btn = document.getElementById('staToggleBtn');
-    if(enabled) {
+    if(!btn) return;
+    const on = !!enabled;
+    btn.dataset.enabled = on ? 'true' : 'false';
+    if(on) {
         btn.textContent = '✓ ON';
         btn.className = 'btn btn-sta-on';
-        btn.style.minWidth = '90px';
     } else {
         btn.textContent = '✗ OFF';
         btn.className = 'btn btn-sta-off';
-        btn.style.minWidth = '90px';
     }
+    btn.style.minWidth = '90px';
+}
+
+function isStaEnabled() {
+    const btn = document.getElementById('staToggleBtn');
+    return !!(btn && btn.dataset && btn.dataset.enabled === 'true');
 }
 
 function loadWiFiStatus() {
-    fetch('/api/wifi').then(r=>r.json()).then(d=>{
-        document.getElementById('ssid').value=d.ssid||'';
+    if(loadWiFiStatus._inflight) return;
+    loadWiFiStatus._inflight = true;
+    fetchWithTimeout('/api/wifi', {}, 8000).then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
+        loadWiFiStatus._inflight = false;
+        if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+        const ssidEl = document.getElementById('ssid');
+        const active = document.activeElement;
+        const serverSSID = d.ssid || '';
+        if (ssidEl && active !== ssidEl && ssidEl.value !== serverSSID) {
+            ssidEl.value = serverSSID;
+        }
+        window._lastSSID = serverSSID;
         const staEnabled = d.sta_enabled !== undefined ? d.sta_enabled : true;
         updateStaButton(staEnabled);
         const stationDiv = document.getElementById('stationConfig');
@@ -1462,48 +1986,101 @@ function loadWiFiStatus() {
             const inputs = stationDiv.querySelectorAll('input, button');
             inputs.forEach(inp => inp.disabled = !staEnabled);
         }
-        const s=document.getElementById('status');
-        s.style.display='';
+        const s = document.getElementById('status');
+        if(!s) return;
+        s.style.display = '';
+        s.textContent = '';
         if(staEnabled && d.connected){
-            const bars=rssiBar(d.rssi||0);
-            s.innerHTML='<span style="font-weight:700">✓ Connected</span> to: <strong>'+d.ssid+'</strong> ('+d.ip+') &nbsp;'+bars+' '+d.rssi+'dBm';
-            s.className='alert ai';
+            const span1 = document.createElement('span');
+            span1.style.fontWeight = '700';
+            span1.textContent = '✓ Connected';
+            s.appendChild(span1);
+            s.appendChild(document.createTextNode(' to: '));
+            const strong = document.createElement('strong');
+            strong.textContent = d.ssid || '';
+            s.appendChild(strong);
+            s.appendChild(document.createTextNode(' ('+(d.ip||'')+') '));
+            const bars = document.createElement('span');
+            bars.innerHTML = rssiBar(d.rssi||0);
+            s.appendChild(bars);
+            s.appendChild(document.createTextNode(' '+(d.rssi||0)+'dBm'));
+            s.className = 'alert ai';
         } else if(staEnabled && !d.connected) {
-            s.innerHTML='<span style="font-weight:700">⚠ Not Connected</span><br>Configure SSID/password above to connect to a WiFi network.';
-            s.className='alert aw';
+            const b1 = document.createElement('span');
+            b1.style.fontWeight = '700';
+            b1.textContent = '⚠ Not Connected';
+            s.appendChild(b1);
+            s.appendChild(document.createElement('br'));
+            s.appendChild(document.createTextNode('Configure SSID/password above to connect to a WiFi network.'));
+            s.className = 'alert aw';
         } else {
-            s.innerHTML='<span style="font-weight:700">⛔ WiFi Station Disabled</span><br>ESP32S3 running in AP-only mode. Enable above to connect to WiFi networks for NTP time sync.';
-            s.className='alert aw';
+            const b1 = document.createElement('span');
+            b1.style.fontWeight = '700';
+            b1.textContent = '⛔ WiFi Station Disabled';
+            s.appendChild(b1);
+            s.appendChild(document.createElement('br'));
+            s.appendChild(document.createTextNode('ESP32S3 running in AP-only mode. Enable above to connect to WiFi networks for NTP time sync.'));
+            s.className = 'alert aw';
         }
-    }).catch(()=>{});
+    }).catch(()=>{
+        loadWiFiStatus._inflight = false;
+        const s = document.getElementById('status');
+        if(s){
+            s.style.display = '';
+            s.textContent = '';
+            const b1 = document.createElement('span');
+            b1.style.fontWeight = '700';
+            b1.textContent = '⚠ Could not refresh WiFi status';
+            s.appendChild(b1);
+            s.className = 'alert aw';
+        }
+    });
 }
 
 function rssiBar(rssi){
-    const b=rssi>=-50?4:rssi>=-60?3:rssi>=-70?2:1;
-    let s='<span class="bars">';
-    for(let i=1;i<=4;i++)s+='<span class="bar'+(i<=b?' on':'')+('" style="height:'+(i*3+2)+'px"></span>');
-    return s+'</span>';
+    const r = (typeof rssi === 'number' && isFinite(rssi)) ? rssi : -100;
+    const b = r >= -50 ? 4 : r >= -60 ? 3 : r >= -70 ? 2 : 1;
+    let s = '<span class="bars">';
+    for(let i = 1; i <= 4; i++){
+        s += '<span class="bar' + (i <= b ? ' on' : '') + '" style="height:' + (i*3+2) + 'px"></span>';
+    }
+    return s + '</span>';
 }
 
 function toggleStation() {
     const btn = document.getElementById('staToggleBtn');
-    const wasEnabled = btn.textContent === '✓ ON';
+    if(!btn || btn.disabled) return;
+    const wasEnabled = isStaEnabled();
     const willEnable = !wasEnabled;
-    
     btn.disabled = true;
     btn.textContent = '...';
-    
-    fetch('/api/wifi', {
+    fetchWithTimeout('/api/wifi', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({sta_enabled: willEnable})
-    }).then(r=>r.json()).then(d=>{
+    }, 10000).then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
         btn.disabled = false;
+        if(!d || typeof d !== 'object' || Array.isArray(d)){
+            toast('Failed to toggle WiFi station', false);
+            updateStaButton(wasEnabled);
+            return;
+        }
         if(d.success) {
             updateStaButton(willEnable);
-            toast('WiFi Station ' + (willEnable ? 'ON' : 'OFF'), true);
             if(!willEnable) {
-                toast('NTP time sync unavailable until re-enabled. Use DS3231 RTC or browser sync.', false);
+                window._staDisabled = true;
+                if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+                if(pollScan){ pollScan._inflight = false; }
+                if(scanning) endScan();
+                const nlReset = document.getElementById('netlist');
+                if(nlReset){ nlReset.innerHTML=''; nlReset.style.display='none'; }
+                toast('WiFi Station OFF \u2014 NTP unavailable; use RTC/Browser sync', false);
+            } else {
+                window._staDisabled = false;
+                toast('WiFi Station ON', true);
             }
             const stationDiv = document.getElementById('stationConfig');
             if(stationDiv) {
@@ -1520,85 +2097,160 @@ function toggleStation() {
         btn.disabled = false;
         toast('Error toggling WiFi station', false);
         updateStaButton(wasEnabled);
+        setTimeout(loadWiFiStatus, 1000);
     });
 }
 
 let scanTimer=null,scanning=false;
 function startScan(){
-    const staEnabled = document.getElementById('staToggleBtn').textContent === '✓ ON';
-    if(!staEnabled) {
+    if(!isStaEnabled()) {
         toast('Please enable WiFi Station Mode first', false);
         return;
     }
+    window._staDisabled = false;
     if(scanning)return;
     scanning=true;
-    document.getElementById('scanBtn').textContent='\u23F3 Scanning\u2026';
-    document.getElementById('scanBtn').disabled=true;
-    const nl=document.getElementById('netlist');
-    nl.style.display='block';
-    nl.innerHTML='<div style="text-align:center;color:#90A4AE;padding:12px;font-size:13px">📡 Scanning for networks...</div>';
-    fetch('/api/wifi/scan',{method:'POST'})
-    .then(()=>{ 
-        scanTimer=setInterval(pollScan,2500); 
+    const scanBtn = document.getElementById('scanBtn');
+    if(scanBtn){
+        scanBtn.textContent = '\u23F3 Scanning\u2026';
+        scanBtn.disabled = true;
+    }
+    const nl = document.getElementById('netlist');
+    if(nl){
+        nl.style.display = 'block';
+        nl.innerHTML = '<div style="text-align:center;color:#90A4AE;padding:12px;font-size:13px">📡 Scanning for networks...</div>';
+    }
+    fetchWithTimeout('/api/wifi/scan', {method:'POST'}, 10000)
+    .then(r => {
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
     })
-    .catch(()=>endScan());
+    .then(()=>{
+        if(scanTimer){ clearInterval(scanTimer); scanTimer = null; }
+        pollScan._inflight = false;
+        scanTimer = setInterval(pollScan, 2500);
+    })
+    .catch(()=>{
+        endScan();
+        toast('Scan failed \u2014 enable WiFi Station', false);
+        const nl2 = document.getElementById('netlist');
+        if(nl2){ nl2.innerHTML = ''; nl2.style.display = 'none'; }
+    });
 }
 function pollScan(){
-    fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{
-        if(!d.scanning){clearInterval(scanTimer);endScan();renderNets(d.networks||[]);}
-    }).catch(()=>{clearInterval(scanTimer);endScan();});
+    if(pollScan._inflight) return;
+    pollScan._inflight = true;
+    fetchWithTimeout('/api/wifi/scan', {}, 10000).then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
+        pollScan._inflight = false;
+        if(window._staDisabled){ return; }
+        if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+        if(!d.scanning){
+            if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+            endScan();
+            const nets = Array.isArray(d.networks) ? d.networks : [];
+            renderNets(nets);
+        }
+    }).catch(()=>{
+        pollScan._inflight = false;
+        if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+        endScan();
+        toast('Scan poll failed', false);
+    });
 }
 function endScan(){
-    scanning=false;
-    document.getElementById('scanBtn').textContent='\uD83D\uDCF6 Scan';
-    document.getElementById('scanBtn').disabled=false;
+    scanning = false;
+    const btn = document.getElementById('scanBtn');
+    if(btn){
+        btn.textContent = '\uD83D\uDCF6 Scan';
+        btn.disabled = false;
+    }
 }
 function renderNets(nets){
-    const nl=document.getElementById('netlist');
-    if(!nets.length){nl.innerHTML='<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found. Make sure WiFi is enabled.</div>';return;}
+    const nl = document.getElementById('netlist');
+    if(!nl) return;
+    if(!Array.isArray(nets) || nets.length === 0){
+        nl.innerHTML = '<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found. Make sure WiFi is enabled.</div>';
+        return;
+    }
     const frag=document.createDocumentFragment();
     const hdr=document.createElement('div');hdr.className='net-hdr';hdr.textContent='Available Networks';frag.appendChild(hdr);
-    nets.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{
+    const sorted = nets.slice().sort((a,b)=>(b.rssi||0)-(a.rssi||0));
+    sorted.forEach(n=>{
         const d=document.createElement('div');d.className='netitem';
         const ns=document.createElement('span');ns.className='ns';ns.textContent=n.ssid;
-        const nr=document.createElement('span');nr.className='nr';nr.textContent=n.rssi+'dBm';
-        const bar=document.createElement('span');bar.innerHTML=rssiBar(n.rssi);
+        const nr=document.createElement('span');nr.className='nr';nr.textContent=(n.rssi||0)+'dBm';
+        const bar=document.createElement('span');bar.innerHTML=rssiBar(n.rssi||0);
         const lock=document.createElement('span');lock.style.fontSize='13px';lock.textContent=n.enc?'\uD83D\uDD12':'';
         d.appendChild(ns);d.appendChild(nr);d.appendChild(bar);d.appendChild(lock);
-        d.addEventListener('click',()=>{document.getElementById('ssid').value=n.ssid;document.getElementById('pw').focus();});
+        d.addEventListener('click',()=>{
+            const ssidEl=document.getElementById('ssid');
+            const pwEl=document.getElementById('pw');
+            if(ssidEl && ssidEl.value !== n.ssid && pwEl) pwEl.value='';
+            if(ssidEl) ssidEl.value=n.ssid;
+            if(pwEl) pwEl.focus();
+        });
         frag.appendChild(d);
     });
     nl.innerHTML='';nl.appendChild(frag);
 }
 function saveWiFi(){
-    const staEnabled = document.getElementById('staToggleBtn').textContent === '✓ ON';
-    if(!staEnabled) {
+    if(!isStaEnabled()) {
         toast('Enable WiFi Station Mode first to save credentials', false);
         return;
     }
-    const ssid=document.getElementById('ssid').value.trim();
-    if(!ssid){toast('SSID required',false);return;}
+    const ssidEl = document.getElementById('ssid');
+    if(!ssidEl){ toast('SSID field not found', false); return; }
+    const ssid = ssidEl.value.trim();
+    if(!ssid){ toast('SSID required', false); return; }
+    try {
+        if(new TextEncoder().encode(ssid).length > 31){ toast('SSID must be 31 bytes or less', false); return; }
+    } catch(e) {
+        if(ssid.length > 31){ toast('SSID must be 31 characters or less', false); return; }
+    }
     const btn = document.querySelector('.bsave');
+    if(!btn || btn.disabled) return;
     btn.disabled = true;
     btn.textContent = 'Saving...';
-    const body = {ssid: ssid, password: document.getElementById('pw').value};
-    fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
+    const body = {ssid: ssid};
+    const pwEl = document.getElementById('pw');
+    const pwVal = pwEl ? pwEl.value : '';
+    if (pwVal.length > 0) body.password = pwVal;
+    const lastKnownSSID = (typeof window._lastSSID === 'string') ? window._lastSSID : '';
+    const ssidChanged = (ssid !== lastKnownSSID);
+    fetchWithTimeout('/api/wifi', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(body)
+    }, 15000)
+    .then(r=>{
+        if(!r.ok) return r.json().catch(()=>({error:'HTTP '+r.status})).then(e=>Promise.reject(e));
+        return r.json();
+    }).then(d=>{
         btn.disabled = false;
         btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
-        if(d.success){
-            toast('Credentials saved! Reconnecting...');
-            setTimeout(()=>window.location.href='/',3000);
-        } else {
-            toast('Failed: '+d.error, false);
+        if(!d || typeof d !== 'object' || Array.isArray(d)){
+            toast('Error: invalid response', false);
+            return;
         }
-    }).catch(()=>{
+        if(d.success){
+            if(ssidChanged){
+                toast('Credentials saved! Reconnecting...');
+                setTimeout(()=>{ window.location.href='/'; }, 3000);
+            } else {
+                toast('Settings saved.');
+            }
+        } else {
+            toast('Failed: '+(d.error||'Unknown'), false);
+        }
+    }).catch((e)=>{
         btn.disabled = false;
         btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
-        toast('Error',false);
+        toast('Error: '+((e && e.error) || 'request failed'), false);
     });
 }
-
 loadWiFiStatus();
 </script></body></html>)raw";
 
@@ -1618,19 +2270,29 @@ const char ntp_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/gpio">GPIO</a>
 <a href="/system">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">Time &amp; NTP Settings</p>
 <div class="card fcrd">
 <div id="timeStatus" class="alert ai" style="display:none;margin-bottom:12px"></div>
 <div class="fg">
+<label>Timezone</label>
+<select id="tz">
+<option value="">Loading&hellip;</option>
+</select>
+<small id="tzInfo">Auto-DST handled by firmware. Transitions detected within 5 seconds.</small>
+</div>
+<div class="fg">
+<label>Manual GMT Offset (seconds)</label>
+<input type="number" id="gmt" readonly style="background:#ECEFF1;color:#607D8B">
+<small>Read-only when a named timezone is selected. Select &quot;UTC&quot; and enter manual offset to override.</small>
+</div>
+<div class="fg">
 <label>NTP Server</label>
 <input type="text" id="srv" placeholder="time.google.com" required>
 <small>Fallbacks: time.google.com &rarr; time.windows.com &rarr; time.cloudflare.com &rarr; time.facebook.com</small>
 </div>
-<div class="fg"><label>GMT Offset (seconds)</label><input type="number" id="gmt" required></div>
-<div class="fg"><label>Daylight Saving (seconds)</label><input type="number" id="dst" value="0"></div>
 <div class="fg"><label>Auto Sync (hours, 1&ndash;24)</label><input type="number" id="shi" min="1" max="24" value="1"></div>
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:stretch">
 <button class="btn bsave" style="flex:1;min-width:140px;margin-top:0;height:40px;padding:0 12px;background:#1565C0;color:#fff;border-radius:6px;font-size:13px;font-weight:600" onclick="save()">&#x1F4BE; Save Settings</button>
@@ -1643,20 +2305,42 @@ const char ntp_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}updateTimeStatus(d);}).catch(()=>{});}
+let lastNtpSyncAge = -1;
+function fmtOff(s){const h=Math.floor(Math.abs(s)/3600);const m=Math.floor((Math.abs(s)%3600)/60);return (s<0?'-':'+')+h+(m?':'+String(m).padStart(2,'0'):'');}
+function tick(){
+  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';const auth=(typeof d.authority==='string'&&d.authority)?d.authority:d.timeSource;if(auth==='ntp'){tc=(d.authorityStale===true)?'y':'g';}else if(auth==='browser')tc='y';else if(auth==='ds3231')tc='g';else if(auth==='internal_rtc')tc='y';else if(auth==='rtc')tc=(d.rtcPresent===true)?'g':'y';else tc='y';t.className='dot '+tc;}if(typeof d.ntpSyncAge === 'number' && d.ntpSyncAge !== 4294967295 && d.ntpSyncAge >= 0)lastNtpSyncAge=d.ntpSyncAge;updateTimeStatus(d);}).catch(()=>{});}
 function updateTimeStatus(d){
   const s=document.getElementById('timeStatus');
   s.style.display='block';
   let icon='',msg='',cls='ai';
-  if(d.timeSource==='ntp'){
-    icon='&#x2705;';msg='Time source: <strong>NTP Server</strong> — High Accuracy';
-    cls='ai';
-  }else if(d.timeSource==='browser'){
+  const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+  const isStale = (d.authorityStale === true);
+  if(auth==='ntp'){
+    if(isStale){
+      icon='&#x26A0;&#xFE0F;';
+      msg='Time source: <strong>NTP Server</strong> — Stale, awaiting resync';
+      cls='aw';
+    }else{
+      icon='&#x2705;';msg='Time source: <strong>NTP Server</strong> — High Accuracy';
+      cls='ai';
+    }
+  }else if(auth==='browser'){
     icon='&#x1F310;';msg='Time source: <strong>Browser Sync</strong> — Moderate Accuracy';
     cls='aw';
-  }else if(d.timeSource==='rtc'){
+  }else if(auth==='ds3231'){
     icon='&#x1F4BF;';msg='Time source: <strong>DS3231 Real Time Clock</strong> — High Accuracy';
     cls='ai';
+  }else if(auth==='internal_rtc'){
+    icon='&#x1F4BF;';msg='Time source: <strong>Internal RTC (NVS)</strong> — Moderate Accuracy';
+    cls='aw';
+  }else if(auth==='rtc'){
+    if(d.rtcPresent){
+      icon='&#x1F4BF;';msg='Time source: <strong>DS3231 Real Time Clock</strong> — High Accuracy';
+      cls='ai';
+    }else{
+      icon='&#x1F4BF;';msg='Time source: <strong>Internal RTC (NVS)</strong> — Moderate Accuracy';
+      cls='aw';
+    }
   }else{
     icon='&#x26A0;&#xFE0F;';msg='Time source: <strong>None</strong> — Please sync time';
     cls='aw';
@@ -1664,38 +2348,172 @@ function updateTimeStatus(d){
   let rtcInfo = '';
   if(d.rtcPresent){
     rtcInfo = '<br><small>✅ DS3231 RTC detected on GPIO8/9';
-    if(d.rtcSynced) rtcInfo += ' | Last sync: ' + d.rtcSyncAge + 's ago';
+    if(d.rtcSynced){
+      const age = (typeof d.rtcSyncAge === 'number') ? d.rtcSyncAge : -1;
+      if(age < 0 || age === 4294967295){
+        rtcInfo += ' | Last sync: Never';
+      } else {
+        rtcInfo += ' | Last sync: ' + age + 's ago';
+      }
+    }
     rtcInfo += '</small>';
   } else {
     rtcInfo = '<br><small>⚠️ DS3231 RTC not detected</small>';
   }
-  s.innerHTML=icon+' '+msg+rtcInfo;
+  let dstInfo = '';
+  if(d.tzName){
+    const tzSafe = String(d.tzName).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    dstInfo = '<br><small>🌍 Timezone: <strong>' + tzSafe + '</strong>';
+    if(d.dstActive){
+      dstInfo += ' — <span style="color:#E65100;font-weight:700">DST ACTIVE</span>';
+    } else {
+      dstInfo += ' — Standard Time';
+    }
+    dstInfo += '</small>';
+  }
+  s.innerHTML=icon+' '+msg+rtcInfo+dstInfo;
   s.className='alert '+cls;
 }
 setInterval(tick,1000);tick();
-fetch('/api/ntp').then(r=>r.json()).then(d=>{
-  document.getElementById('srv').value=d.ntpServer||'time.google.com';
-  document.getElementById('gmt').value=d.gmtOffset||28800;
-  document.getElementById('dst').value=d.daylightOffset||0;
-  document.getElementById('shi').value=d.syncHours||1;
-}).catch(()=>{});
+
+let tzList = [];
+function loadTZ(){
+  fetch('/api/timezones').then(r=>r.json()).then(d=>{
+    tzList = d.timezones || [];
+    const sel = document.getElementById('tz');
+    sel.innerHTML = '';
+    tzList.forEach(z=>{
+      const o = document.createElement('option');
+      o.value = z.name;
+      o.textContent = z.name + ' (UTC' + fmtOff(z.offset) + (z.dst ? ' +DST' : '') + ')';
+      sel.appendChild(o);
+    });
+    const manualOpt = document.createElement('option');
+    manualOpt.value = 'Manual';
+    manualOpt.textContent = 'Manual Offset (custom GMT)';
+    sel.appendChild(manualOpt);
+    fetch('/api/ntp').then(r=>r.json()).then(cfg=>{
+      if (cfg.tzName && cfg.tzName !== 'Manual' && !tzList.some(z => z.name === cfg.tzName)) {
+        const o = document.createElement('option');
+        o.value = cfg.tzName;
+        o.textContent = cfg.tzName + ' (' + fmtOff(cfg.gmtOffset || 0) + ')';
+        sel.appendChild(o);
+      }
+      sel.value = cfg.tzName || 'UTC';
+      const gmtEl = document.getElementById('gmt');
+      if(gmtEl && typeof cfg.gmtOffset === 'number') gmtEl.value = cfg.gmtOffset;
+      const srvEl = document.getElementById('srv');
+      if(srvEl) srvEl.value = (typeof cfg.ntpServer === 'string' && cfg.ntpServer) ? cfg.ntpServer : 'time.google.com';
+      const shiEl = document.getElementById('shi');
+      if(shiEl) shiEl.value = (typeof cfg.syncHours === 'number' && cfg.syncHours >= 1 && cfg.syncHours <= 24) ? cfg.syncHours : 1;
+      updateTzInfo(cfg);
+      toggleGmtField();
+    }).catch(()=>{});
+  }).catch(()=>{
+    document.getElementById('tz').innerHTML = '<option value="UTC">UTC</option>';
+  });
+  const selEl = document.getElementById('tz');
+  if(selEl && !selEl._hasTzListener) {
+    selEl.addEventListener('change', toggleGmtField);
+    selEl._hasTzListener = true;
+  }
+}
+function updateTzInfo(cfg){
+  const info = document.getElementById('tzInfo');
+  if(cfg.tzAutoDst){
+    const dstH = (typeof cfg.dstOffset === 'number') ? (cfg.dstOffset/3600) : 0;
+    info.textContent = 'Auto-DST enabled. Current DST: ' +
+      (cfg.dstActive ? 'ACTIVE (+' + dstH + 'h)' : 'inactive') +
+      '. Transitions detected within 5 seconds.';
+  } else {
+    info.textContent = 'Manual offset mode. DST not applied automatically.';
+  }
+  const gmtEl = document.getElementById('gmt');
+  if(gmtEl && typeof cfg.gmtOffset === 'number') gmtEl.value = cfg.gmtOffset;
+}
+
+function toggleGmtField(){
+  const tzEl = document.getElementById('tz');
+  const gmtEl = document.getElementById('gmt');
+  const info = document.getElementById('tzInfo');
+  if(!tzEl || !gmtEl) return;
+  const tzVal = tzEl.value;
+  const isManual = (tzVal === 'Manual' || tzVal === '');
+  gmtEl.readOnly = !isManual;
+  gmtEl.style.background = isManual ? '#fff' : '#ECEFF1';
+  gmtEl.style.color = isManual ? '#1A1A2E' : '#607D8B';
+  if(isManual && info){
+    info.textContent = 'Manual offset mode. Enter GMT offset in seconds (e.g. 20700 = UTC+5:45). DST not applied automatically.';
+  }
+}
 function save(){
   const h=parseInt(document.getElementById('shi').value);
-  if(h<1||h>24){toast('Sync interval must be 1\u201324 h',false);return;}
-  fetch('/api/ntp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    ntpServer:document.getElementById('srv').value,
-    gmtOffset:parseInt(document.getElementById('gmt').value),
-    daylightOffset:parseInt(document.getElementById('dst').value),
-    syncHours:h
-  })}).then(r=>r.json()).then(d=>{if(d.success)toast('NTP settings saved!');else toast('Failed: '+d.error,false);})
-  .catch(()=>toast('Error',false));
+  if(isNaN(h)||h<1||h>24){toast('Sync interval must be 1\u201324 h',false);return;}
+  const srvVal = document.getElementById('srv').value.trim();
+  if(srvVal.length === 0){toast('NTP server cannot be empty', false); return;}
+  if(srvVal.length >= 48){toast('NTP server must be 47 characters or less', false); return;}
+  const body = {
+    ntpServer: srvVal,
+    syncHours: h
+  };
+  const tzVal = document.getElementById('tz').value;
+  if(tzVal === 'Manual' || tzVal === ''){
+    const gmtVal = parseInt(document.getElementById('gmt').value);
+    if(isNaN(gmtVal) || gmtVal < -50400 || gmtVal > 50400){
+      toast('GMT offset must be between -50400 and 50400 seconds', false);
+      return;
+    }
+    body.gmtOffset = gmtVal;
+  } else if(tzVal && tzVal.length > 0){
+    body.tzName = tzVal;
+  }
+  fetch('/api/ntp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if(d.success){
+        toast('NTP settings saved!');
+        loadTZ();
+        tick();
+      } else {
+        toast('Failed: '+d.error,false);
+      }
+    }).catch(()=>toast('Error',false));
 }
 function sync(){
-  const b=document.getElementById('sbtn');b.disabled=true;b.textContent='Syncing\u2026';
+  const b=document.getElementById('sbtn');
+  b.disabled=true;b.textContent='Syncing\u2026';
+  const preAge = lastNtpSyncAge;
+  const startTs = Date.now();
   fetch('/api/ntp/sync',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(!d.success){
+      b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
+      toast('Sync failed \u2014 ' + (d.error || 'check WiFi/NTP'), false);
+      return;
+    }
+    toast('NTP sync initiated\u2026');
+    let attempts = 0;
+    const poll = setInterval(()=>{
+      attempts++;
+      fetch('/api/time').then(r=>r.json()).then(t=>{
+        const age = (typeof t.ntpSyncAge !== 'number' || t.ntpSyncAge === 4294967295 || t.ntpSyncAge < 0) ? -1 : t.ntpSyncAge;
+        const preAgeSafe = (typeof preAge === 'number' && preAge >= 0) ? preAge : -1;
+        const isFresh = (t.timeSource === 'ntp') && (age >= 0) && (age < 15);
+        const isNewer = (preAgeSafe < 0) || (age >= 0 && age < preAgeSafe);
+        if(isFresh && isNewer){
+          clearInterval(poll);
+          b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
+          toast('Time synced via NTP!');
+          tick();
+        } else if(attempts >= 20 || (Date.now() - startTs) > 35000){
+          clearInterval(poll);
+          b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
+          toast('NTP sync did not complete \u2014 check network', false);
+        }
+      }).catch(()=>{});
+    }, 1000);
+  }).catch(()=>{
     b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
-    if(d.success)toast('Time synced via NTP!');else toast('Sync failed \u2014 check WiFi/NTP',false);
-  }).catch(()=>{b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';toast('Error',false);});
+    toast('Error',false);
+  });
 }
 function syncFromBrowser(){
   const b=document.getElementById('bsbtn');
@@ -1712,8 +2530,14 @@ function syncFromBrowser(){
     b.disabled = false;
     b.innerHTML = '&#x1F310; Sync Browser';
     if (d.success) {
-      document.getElementById('clk').textContent = d.local_time;
-      let msg = 'Time synced from browser! Local time: ' + d.local_time;
+      const clkEl = document.getElementById('clk');
+      const dateEl = document.getElementById('date');
+      const safeTime = (typeof d.local_time === 'string' && d.local_time) ? d.local_time : '--:--:--';
+      const safeDate = (typeof d.local_date === 'string' && d.local_date) ? d.local_date : '--/--/----';
+      const safeWday = (typeof d.weekday === 'string' && d.weekday) ? d.weekday : '';
+      if(clkEl) clkEl.textContent = safeTime;
+      if(dateEl) dateEl.textContent = (safeWday ? safeWday + ' ' : '') + safeDate;
+      let msg = 'Time synced from browser! Local time: ' + safeTime + (safeDate !== '--/--/----' ? ' ' + safeDate : '');
       if(d.rtc_synced) msg += ' | DS3231 updated';
       toast(msg);
       tick();
@@ -1727,6 +2551,7 @@ function syncFromBrowser(){
     toast('Error syncing time from browser', false);
   });
 }
+loadTZ();
 </script></body></html>)raw";
 
 // =============================================================================
@@ -1745,14 +2570,16 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/gpio">GPIO</a>
 <a href="/system">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">Access Point Settings</p>
 <div class="card fcrd">
+<form onsubmit="return false" autocomplete="off">
 <div class="alert aw">&#x26A0;&#xFE0F; Changing SSID, Password, Channel or Visibility will restart the AP and disconnect all clients. Reconnect to the new SSID afterward.</div>
 <div class="fg"><label>AP SSID</label><input type="text" id="ssid" maxlength="31" required></div>
-<div class="fg"><label>AP Password</label><input type="password" id="pw" minlength="8" placeholder="Enter wifi password"></div>
+<div class="fg"><label>AP Password</label><input type="password" id="pw" minlength="8" maxlength="31" placeholder="Leave blank to keep current password"></div>
+<div class="fg" style="margin-top:-6px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none;font-size:13px;font-weight:500;color:#1A1A2E"><input type="checkbox" id="clearPw" style="width:auto;margin:0"> Remove password (make AP open)</label></div>
 <div class="fg">
 <label>Channel (1&ndash;13)</label>
 <select id="ch">
@@ -1771,31 +2598,211 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <option value="1">Hidden (do not broadcast)</option>
 </select>
 </div>
-<button class="btn bsave" onclick="save()">&#x1F4BE; Save Settings</button>
+<button type="button" class="btn bsave" onclick="save()" id="apSaveBtn">&#x1F4BE; Save Settings</button>
+</form>
 </div>
 </main>
 <div id="toast"></div>
 <script>
-function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
-setInterval(tick,1000);tick();
-fetch('/api/ap').then(r=>r.json()).then(d=>{
-  document.getElementById('ssid').value=d.ap_ssid||'';
-  document.getElementById('ch').value=d.ap_channel||6;
-  document.getElementById('hidden').value=d.ap_hidden?'1':'0';
-}).catch(()=>{});
+function toast(m,ok=true){
+  const t=document.getElementById('toast');
+  if(!t) return;
+  t.textContent = (typeof m === 'string') ? m : String(m == null ? '' : m);
+  t.className='show '+(ok?'ok':'er');
+  clearTimeout(t._t);
+  t._t=setTimeout(()=>t.className='',3000);
+}
+function escapeHtml(text){const d=document.createElement('div');d.textContent=String(text==null?'':text);return d.innerHTML;}
+
+function fetchWithTimeout(url, options, timeout){
+  options = options || {};
+  timeout = timeout || 10000;
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), timeout);
+  const opts = Object.assign({}, options, {signal: controller.signal});
+  return fetch(url, opts).then(
+    r => { clearTimeout(timer); return r; },
+    e => { clearTimeout(timer); throw e; }
+  );
+}
+
+let savingAP = false;
+let tickIntervalId = null;
+
+function tick(){
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetchWithTimeout('/api/time', {}, 8000).then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    tick._inflight = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = d.time || '--:--:--';
+    const de = document.getElementById('date');
+    if(de) de.textContent = (d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');
+    const w = document.querySelector('.wd'), t = document.querySelector('.td');
+    if(w) w.className='dot '+(d.wifi?'g':'r');
+    if(t){
+      let tc='y';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth==='ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth==='browser')tc='y';
+      else if(auth==='ds3231')tc='g';
+      else if(auth==='internal_rtc')tc='y';
+      else if(auth==='rtc')tc=(d.rtcPresent === true) ? 'g' : 'y';
+      else tc='y';
+      t.className='dot '+tc;
+    }
+  }).catch(()=>{ tick._inflight = false; });
+}
+tickIntervalId = setInterval(tick,1000);
+tick();
+
+fetchWithTimeout('/api/ap', {}, 8000).then(r=>{
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}).then(d=>{
+  if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+  const ssidEl = document.getElementById('ssid');
+  if(ssidEl) ssidEl.value = d.ap_ssid || '';
+  const chEl = document.getElementById('ch');
+  if(chEl) chEl.value = d.ap_channel || 6;
+  const hiddenEl = document.getElementById('hidden');
+  if(hiddenEl) hiddenEl.value = d.ap_hidden ? '1' : '0';
+  const pwEl = document.getElementById('pw');
+  const clearEl = document.getElementById('clearPw');
+  if(pwEl) pwEl.addEventListener('input', function(){ if(this.value.length > 0 && clearEl) clearEl.checked = false; });
+  if(clearEl) clearEl.addEventListener('change', function(){ if(this.checked && pwEl) pwEl.value = ''; });
+}).catch(()=>{
+  toast('Could not load AP settings \u2014 check connection', false);
+});
+
 function save(){
-  const pw=document.getElementById('pw').value;
-  if(pw.length>0&&pw.length<8){toast('Password must be 8+ chars or blank',false);return;}
-  fetch('/api/ap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    ap_ssid:document.getElementById('ssid').value,
-    ap_password:pw,
-    ap_channel:parseInt(document.getElementById('ch').value),
-    ap_hidden:document.getElementById('hidden').value==='1'
-  })}).then(r=>r.json()).then(d=>{
-    if(d.success){toast('Settings saved!');if(d.restarted)toast('AP restarted - reconnect to new network');setTimeout(()=>location.reload(),4000);}
-    else toast('Failed: '+d.error,false);
-  }).catch(()=>toast('Error',false));
+  if(savingAP) return;
+  const btn = document.getElementById('apSaveBtn') || document.querySelector('.bsave');
+
+  const ssidEl = document.getElementById('ssid');
+  if(!ssidEl){ toast('SSID field not found', false); return; }
+  const ssid = (ssidEl.value || '').trim();
+  if(!ssid){ toast('SSID cannot be empty', false); return; }
+  if(ssid.length > 31){ toast('SSID must be 31 characters or less', false); return; }
+  try {
+    if(new TextEncoder().encode(ssid).length > 31){ toast('SSID too long (max 31 bytes)', false); return; }
+  } catch(e) {}
+
+  const pwEl = document.getElementById('pw');
+  const pw = pwEl ? (pwEl.value || '') : '';
+  const clearPwEl = document.getElementById('clearPw');
+  const shouldClear = !!(clearPwEl && clearPwEl.checked);
+
+  let pwBytes = pw.length;
+  try { pwBytes = new TextEncoder().encode(pw).length; } catch(e) {}
+
+  if(!shouldClear && pw.length > 0 && pw.length < 8){
+    toast('Password must be 8+ characters or blank', false);
+    return;
+  }
+  if(pwBytes > 31){
+    toast('Password must be 31 bytes or less', false);
+    return;
+  }
+  if(shouldClear && pw.length > 0){
+    toast('Uncheck "Remove password" or clear the password field', false);
+    return;
+  }
+
+  const chEl = document.getElementById('ch');
+  const hiddenEl = document.getElementById('hidden');
+  const body = {
+    ap_ssid: ssid,
+    ap_channel: chEl ? (parseInt(chEl.value) || 6) : 6,
+    ap_hidden: hiddenEl ? (hiddenEl.value === '1') : false
+  };
+
+  if(shouldClear){
+    body.ap_password = '';
+  } else if(pw.length > 0){
+    body.ap_password = pw;
+  }
+
+  savingAP = true;
+  if(btn){ btn.disabled = true; btn.textContent = 'Saving...'; }
+
+  let controller;
+  let timeoutId;
+  try {
+    controller = new AbortController();
+    timeoutId = setTimeout(() => controller.abort(), 15000);
+  } catch(err) {
+    savingAP = false;
+    if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+    toast('Error: browser does not support required features', false);
+    return;
+  }
+
+  fetch('/api/ap', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+    signal: controller.signal
+  })
+  .then(r => {
+    if(timeoutId !== undefined) clearTimeout(timeoutId);
+    if(!r.ok){
+      return r.json().then(e => Promise.reject(e)).catch(() => Promise.reject({error:'HTTP '+r.status}));
+    }
+    return r.json();
+  })
+  .then(d => {
+    savingAP = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d)){
+      toast('Error: invalid response from device', false);
+      if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+      return;
+    }
+    if(d.success){
+      if(d.restarted){
+        if(tickIntervalId !== null){ clearInterval(tickIntervalId); tickIntervalId = null; }
+        toast('AP restarted \u2014 reconnect to new network', false);
+        document.body.innerHTML = '<div style="text-align:center;padding:60px 20px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#EEF2F7;min-height:100vh;box-sizing:border-box">'
+          + '<div style="background:#fff;max-width:420px;margin:0 auto;border-radius:12px;padding:32px 24px;box-shadow:0 4px 20px rgba(0,0,0,.1)">'
+          + '<h2 style="color:#1565C0;margin:0 0 16px;font-size:20px">\u2705 AP Settings Saved</h2>'
+          + '<p style="font-size:15px;color:#37474F;margin:0 0 20px">The Access Point has been restarted.</p>'
+          + '<p style="font-size:14px;color:#607D8B;margin:0 0 8px">Reconnect to:</p>'
+          + '<p style="font-size:18px;font-weight:700;color:#1565C0;margin:0 0 20px;word-break:break-word">' + escapeHtml(ssid) + '</p>'
+          + '<p style="font-size:14px;color:#607D8B;margin:0 0 8px">Then open:</p>'
+          + '<p style="font-size:16px;font-weight:700;margin:0"><a href="http://192.168.4.1/" style="color:#1565C0;text-decoration:none">192.168.4.1</a></p>'
+          + '</div></div>';
+      } else {
+        toast('Settings saved!');
+        if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+      }
+    } else {
+      toast('Failed: ' + (d.error || 'Unknown error'), false);
+      if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+    }
+  })
+  .catch((e) => {
+    if(timeoutId !== undefined) clearTimeout(timeoutId);
+    savingAP = false;
+    if(e && e.name === 'AbortError'){
+      toast('Request timed out \u2014 AP may have restarted. Check your network.', false);
+    } else if(e && (e.error || e.message)){
+      const msg = e.error || e.message || 'request failed';
+      if(typeof msg === 'string' && (msg.indexOf('Failed to fetch') >= 0 || msg.indexOf('NetworkError') >= 0)){
+        toast('Network error \u2014 AP may have restarted. Check your network.', false);
+      } else {
+        toast('Error: ' + msg, false);
+      }
+    } else {
+      toast('Error: request failed \u2014 AP may have restarted.', false);
+    }
+    if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+  });
 }
 </script></body></html>)raw";
 
@@ -1815,7 +2822,7 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/gpio" class="cur">GPIO</a>
 <a href="/system">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">GPIO Pin Configuration</p>
@@ -1861,7 +2868,7 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';const auth=(typeof d.authority==='string'&&d.authority)?d.authority:d.timeSource;if(auth==='ntp'){tc=(d.authorityStale===true)?'y':'g';}else if(auth==='browser')tc='y';else if(auth==='ds3231')tc='g';else if(auth==='internal_rtc')tc='y';else if(auth==='rtc')tc=(d.rtcPresent===true)?'g':'y';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
 // change gpio
 const DEFAULT_PINS = [4,5,6,7,11,12,13,14,1,2,42,41,47,21,20,19];
@@ -1960,8 +2967,10 @@ function toggleActiveLow(index) {
 }
 
 function addPin() {
-    const pin = parseInt(document.getElementById('newPin').value);
-    if(!pin) return;
+    const rawVal = document.getElementById('newPin').value;
+    if(rawVal === '') return;
+    const pin = parseInt(rawVal);
+    if(isNaN(pin)) return;
     
     fetch('/api/gpio/add', {
         method:'POST',
@@ -2030,7 +3039,7 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/gpio">GPIO</a>
 <a href="/system" class="cur">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">System Information &amp; Settings</p>
@@ -2040,11 +3049,14 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="ibox"><div class="l">Free Heap</div><div class="v" id="shp">&hellip;</div></div>
 <div class="ibox"><div class="l">Uptime</div><div class="v" id="sup">&hellip;</div></div>
 <div class="ibox"><div class="l">WiFi RSSI</div><div class="v" id="srs">&hellip;</div></div>
-<div class="ibox"><div class="l">Time Source</div><div class="v" id="stsrc" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">Last Sync Source</div><div class="v" id="stsrc" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">Current Authority</div><div class="v" id="sauth" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">Timezone</div><div class="v" id="stz" style="font-size:13px;word-break:break-word">&hellip;</div></div>
+<div class="ibox"><div class="l">DST Status</div><div class="v" id="sdst" style="font-size:13px">&hellip;</div></div>
 <div class="ibox"><div class="l">UTC Epoch</div><div class="v" id="sutc" style="font-size:11px">&hellip;</div></div>
 <div class="ibox"><div class="l">NTP Last Sync</div><div class="v" id="snt">&hellip;</div></div>
 <div class="ibox"><div class="l">Last Browser Sync</div><div class="v" id="sbs">&hellip;</div></div>
-<div class="ibox"><div class="l">NTP Server</div><div class="v" id="sns" style="font-size:12px">&hellip;</div></div>
+<div class="ibox"><div class="l">NTP Server</div><div class="v" id="sns" style="font-size:12px;word-break:break-all">&hellip;</div></div>
 <div class="ibox"><div class="l">Chip Model</div><div class="v" id="sch">&hellip;</div></div>
 <div class="ibox"><div class="l">mDNS Hostname</div><div class="v" id="smdns">&hellip;</div></div>
 <div class="ibox"><div class="l">Relay Count</div><div class="v" id="src">&hellip;</div></div>
@@ -2054,7 +3066,7 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="ibox"><div class="l">DS3231 RTC</div><div class="v" id="srtc">&hellip;</div></div>
 <div class="ibox"><div class="l">DS3231 Last Sync</div><div class="v" id="srtcsync">&hellip;</div></div>
 <div class="ibox"><div class="l">DS3231 Temp</div><div class="v" id="srtctemp">&hellip;</div></div>
-<div class="ibox"><div class="l">Sync Direction</div><div class="v" id="ssyncdir" style="font-size:12px;color:#7B1FA2">&hellip;</div></div>
+<div class="ibox"><div class="l">Sync Direction</div><div class="v" id="ssyncdir" style="font-size:12px;color:#7B1FA2;word-break:break-word">&hellip;</div></div>
 <div class="ibox"><div class="l">WiFi Station</div><div class="v" id="stawifi">&hellip;</div></div>
 </div>
 
@@ -2064,15 +3076,53 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <button class="btn bwarn" onclick="rst()" style="padding:9px 18px;border-radius:6px;font-size:13px;font-weight:600">&#x1F504; Verify Services</button>
 <button class="btn bdanger" onclick="fct()" style="padding:9px 18px;border-radius:6px;font-size:13px;font-weight:600">&#x26A0; Factory Reset</button>
 </div>
-<p style="color:#90A4AE;font-size:12px;margin-top:10px">Factory reset clears all the settings without restarting the device.<br>Alternatively, hold the <strong>BOOT button</strong> for 5 seconds to trigger a hardware factory reset.</p>
+<p style="color:#90A4AE;font-size:12px;margin-top:10px">Factory reset clears all the settings.<br>Alternatively, hold the <strong>BOOT button</strong> for 5 seconds to trigger a hardware factory reset.</p>
 </div>
 </main>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+
+function tick(){
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetch('/api/time').then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    tick._inflight = false;
+    if(!d || typeof d !== 'object') return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = (typeof d.time === 'string' && d.time) ? d.time : '--:--:--';
+    const de = document.getElementById('date');
+    if(de){
+      const wk = (typeof d.weekday === 'string' && d.weekday) ? d.weekday + ' ' : '';
+      const dt = (typeof d.date === 'string' && d.date) ? d.date : '--/--/----';
+      de.textContent = wk + dt;
+    }
+    const w = document.querySelector('.wd');
+    const t = document.querySelector('.td');
+    if(w) w.className = 'dot ' + (d.wifi ? 'g' : 'r');
+    if(t){
+      let tc = 'y';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth === 'ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth === 'browser') tc = 'y';
+      else if(auth === 'ds3231') tc = 'g';
+      else if(auth === 'internal_rtc') tc = 'y';
+      else if(auth === 'rtc') tc = (d.rtcPresent === true) ? 'g' : 'y';
+      else tc = 'y';
+      t.className = 'dot ' + tc;
+    }
+  }).catch(()=>{ tick._inflight = false; });
+}
 setInterval(tick,1000);tick();
+
 function fmtUp(s){
+  if(typeof s !== 'number' || !isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -2082,75 +3132,248 @@ function fmtUp(s){
   if (m > 0) return m + 'm ' + ss + 's';
   return ss + 's';
 }
-function fmtAge(s){if(s===4294967295||s<0)return'Never';if(s<60)return'Just now';if(s<3600)return Math.floor(s/60)+' min ago';const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m ago';}
-function rssiDesc(r){if(!r)return'\u2014';return r+'dBm ('+( r>=-50?'Excellent':r>=-60?'Good':r>=-70?'Fair':'Weak')+')';}
+
+function fmtAge(s){
+  if(typeof s !== 'number' || !isFinite(s) || s < 0 || s === 4294967295) return 'Never';
+  s = Math.floor(s);
+  if(s < 60) return 'Just now';
+  if(s < 3600) return Math.floor(s/60) + ' min ago';
+  const h = Math.floor(s/3600);
+  return h + 'h ' + Math.floor((s%3600)/60) + 'm ago';
+}
+
+function rssiDesc(r){
+  if(typeof r !== 'number' || !isFinite(r) || r === 0) return '\u2014';
+  return r + 'dBm (' + (r>=-50?'Excellent':r>=-60?'Good':r>=-70?'Fair':'Weak') + ')';
+}
+
+function formatGmtOffset(sec){
+  if(typeof sec !== 'number' || !isFinite(sec)) sec = 0;
+  const sign = sec >= 0 ? '+' : '-';
+  const absG = Math.abs(sec);
+  const gh = Math.floor(absG / 3600);
+  const gmn = Math.floor((absG % 3600) / 60);
+  const gss = absG % 60;
+  let s = 'UTC' + sign + gh;
+  if(gmn !== 0 || gss !== 0){
+    s += ':' + String(gmn).padStart(2, '0');
+    if(gss !== 0) s += ':' + String(gss).padStart(2, '0');
+  }
+  return s;
+}
+
+function safeAge(v){
+  return (typeof v === 'number' && isFinite(v) && v >= 0 && v !== 4294967295) ? Math.floor(v) : -1;
+}
+
 function loadSys(){
-  fetch('/api/system').then(r=>r.json()).then(d=>{
-    document.getElementById('sip').textContent=d.wifiConnected?d.ip:'(not connected)';
-    document.getElementById('sap').textContent=d.ap_ip;
-    document.getElementById('shp').textContent=(d.freeHeap/1024).toFixed(1)+' KB';
-    document.getElementById('sup').textContent=fmtUp(d.uptime);
-    document.getElementById('srs').textContent=d.wifiConnected?rssiDesc(d.rssi):'\u2014';
-    const tsrc=d.timeSource||'None';
-    let tsrcStyle='';
-    if(tsrc==='NTP')tsrcStyle='color:#2E7D32';
-    else if(tsrc==='Browser')tsrcStyle='color:#1565C0';
-    else if(tsrc==='RTC')tsrcStyle='color:#7B1FA2';
-    else tsrcStyle='color:#C62828';
-    document.getElementById('stsrc').style.cssText='font-size:13px;font-weight:700;'+tsrcStyle;
-    document.getElementById('stsrc').textContent=tsrc;
-    document.getElementById('sutc').textContent=d.utcEpoch||'\u2014';
-    document.getElementById('snt').textContent=d.ntpSyncAge>=0?fmtAge(d.ntpSyncAge):'Never';
-    document.getElementById('sbs').textContent=d.browserSyncAge>=0?fmtAge(d.browserSyncAge):'Never';
-    document.getElementById('sns').textContent=d.ntpServer||'\u2014';
-    document.getElementById('sch').textContent=d.chipModel||'ESP32S3';
-    document.getElementById('smdns').textContent=d.mdnsStarted ? d.mdnsHostname+'.local' : 'Not running';
-    document.getElementById('src').textContent=d.relayCount+' / '+d.maxRelays;
-    document.getElementById('sgmt').textContent=(d.gmtOffset/3600).toFixed(1)+'h (UTC'+(d.gmtOffset>=0?'+':'')+(d.gmtOffset/3600).toFixed(1)+')';
-    document.getElementById('sdrift').textContent=d.driftComp ? d.driftComp.toFixed(4) : '1.0000';
-    let modeText = '';
-    if(d.globalActiveMode === 1) modeText = '🌍 Global LOW';
-    else if(d.globalActiveMode === 2) modeText = '🌍 Global HIGH';
-    else modeText = '🔧 Per-Relay';
-    document.getElementById('sactmode').textContent = modeText;
-    document.getElementById('srtc').textContent = d.rtcPresent ? '✅ Present' : '❌ Not detected';
-    if(d.rtcPresent) document.getElementById('srtc').style.color='#2E7D32';
-    else document.getElementById('srtc').style.color='#C62828';
-    document.getElementById('srtcsync').textContent = d.rtcSyncAge >= 0 ? fmtAge(d.rtcSyncAge) : 'Never';
+  if(loadSys._inflight) return;
+  loadSys._inflight = true;
+  fetch('/api/system').then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    loadSys._inflight = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d) || Object.keys(d).length === 0) return;
+
+    const sipEl = document.getElementById('sip');
+    if(sipEl) sipEl.textContent = (d.wifiConnected && typeof d.ip === 'string' && d.ip && d.ip !== '0.0.0.0') ? d.ip : '(not connected)';
+
+    const sapEl = document.getElementById('sap');
+    if(sapEl) sapEl.textContent = (typeof d.ap_ip === 'string' && d.ap_ip && d.ap_ip !== '0.0.0.0') ? d.ap_ip : '\u2014';
+
+    const shpEl = document.getElementById('shp');
+    if(shpEl){
+      const fh = (typeof d.freeHeap === 'number' && isFinite(d.freeHeap)) ? d.freeHeap : 0;
+      shpEl.textContent = (fh/1024).toFixed(1) + ' KB';
+    }
+
+    const supEl = document.getElementById('sup');
+    if(supEl) supEl.textContent = fmtUp(d.uptime);
+
+    const srsEl = document.getElementById('srs');
+    if(srsEl) srsEl.textContent = d.wifiConnected ? rssiDesc(d.rssi) : '\u2014';
+
+    const tsrcEl = document.getElementById('stsrc');
+    if(tsrcEl){
+      const tsrc = (typeof d.timeSource === 'string' && d.timeSource) ? d.timeSource : 'None';
+      let tsrcStyle = 'color:#C62828';
+      if(tsrc === 'NTP') tsrcStyle = 'color:#2E7D32';
+      else if(tsrc === 'Browser') tsrcStyle = 'color:#1565C0';
+      else if(tsrc === 'DS3231') tsrcStyle = 'color:#7B1FA2';
+      else if(tsrc === 'Internal RTC') tsrcStyle = 'color:#7B1FA2';
+      tsrcEl.style.cssText = 'font-size:13px;font-weight:700;' + tsrcStyle;
+      tsrcEl.textContent = tsrc;
+    }
+
+    const sauthEl = document.getElementById('sauth');
+    if(sauthEl){
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : '';
+      let authLabel = '—';
+      let authStyle = 'color:#C62828';
+      if(auth === 'ntp'){
+        authLabel = (d.authorityStale === true) ? 'NTP (stale)' : 'NTP';
+        authStyle = (d.authorityStale === true) ? 'color:#F9A825' : 'color:#2E7D32';
+      } else if(auth === 'browser'){
+        authLabel = 'Browser';
+        authStyle = 'color:#1565C0';
+      } else if(auth === 'ds3231'){
+        authLabel = 'DS3231';
+        authStyle = 'color:#7B1FA2';
+      } else if(auth === 'internal_rtc'){
+        authLabel = 'Internal RTC';
+        authStyle = 'color:#F9A825';
+      } else if(auth === 'none'){
+        authLabel = 'None';
+        authStyle = 'color:#C62828';
+      }
+      sauthEl.style.cssText = 'font-size:13px;font-weight:700;' + authStyle;
+      sauthEl.textContent = authLabel;
+    }
+
+    const stzEl = document.getElementById('stz');
+    if(stzEl) stzEl.textContent = (typeof d.tzName === 'string' && d.tzName) ? d.tzName : '\u2014';
+
+    const dstEl = document.getElementById('sdst');
+    if(dstEl){
+      const dstSec = (typeof d.dstOffset === 'number' && isFinite(d.dstOffset)) ? d.dstOffset : 0;
+      if(d.dstActive){
+        const dstH = Math.round(dstSec/3600*100)/100;
+        dstEl.textContent = '\u{1F31E} ACTIVE (+' + dstH + 'h)';
+        dstEl.style.color = '#E65100';
+      } else {
+        dstEl.textContent = '\u2744\uFE0F Standard';
+        dstEl.style.color = '#1565C0';
+      }
+    }
+
+    const sutcEl = document.getElementById('sutc');
+    if(sutcEl){
+      const utcStr = (typeof d.utcEpoch === 'string') ? d.utcEpoch : String(d.utcEpoch || '');
+      sutcEl.textContent = (utcStr && utcStr !== '0') ? utcStr : '\u2014';
+    }
+
+    const sntEl = document.getElementById('snt');
+    if(sntEl){
+      const ntpAge = safeAge(d.ntpSyncAge);
+      sntEl.textContent = ntpAge >= 0 ? fmtAge(ntpAge) : 'Never';
+    }
+
+    const sbsEl = document.getElementById('sbs');
+    if(sbsEl){
+      const bsAge = safeAge(d.browserSyncAge);
+      sbsEl.textContent = bsAge >= 0 ? fmtAge(bsAge) : 'Never';
+    }
+
+    const snsEl = document.getElementById('sns');
+    if(snsEl) snsEl.textContent = (typeof d.ntpServer === 'string' && d.ntpServer) ? d.ntpServer : '\u2014';
+
+    const schEl = document.getElementById('sch');
+    if(schEl) schEl.textContent = (typeof d.chipModel === 'string' && d.chipModel) ? d.chipModel : 'ESP32S3';
+
+    const smdnsEl = document.getElementById('smdns');
+    if(smdnsEl){
+      if(d.mdnsStarted){
+        smdnsEl.textContent = (typeof d.mdnsHostname === 'string' && d.mdnsHostname) ? d.mdnsHostname + '.local' : '\u2014';
+      } else {
+        smdnsEl.textContent = 'Not running';
+      }
+    }
+
+    const srcEl = document.getElementById('src');
+    if(srcEl){
+      const rc = (typeof d.relayCount === 'number' && isFinite(d.relayCount)) ? d.relayCount : 0;
+      const mr = (typeof d.maxRelays === 'number' && isFinite(d.maxRelays)) ? d.maxRelays : 16;
+      srcEl.textContent = rc + ' / ' + mr;
+    }
+
+    const sgmtEl = document.getElementById('sgmt');
+    if(sgmtEl) sgmtEl.textContent = formatGmtOffset(d.gmtOffset);
+
+    const sdriftEl = document.getElementById('sdrift');
+    if(sdriftEl){
+      const dc = (typeof d.driftComp === 'number' && isFinite(d.driftComp) && d.driftComp > 0) ? d.driftComp : 1.0;
+      sdriftEl.textContent = dc.toFixed(4);
+    }
+
+    const sactEl = document.getElementById('sactmode');
+    if(sactEl){
+      let modeText = '\u{1F527} Per-Relay';
+      if(d.globalActiveMode === 1) modeText = '\u{1F30D} Global LOW';
+      else if(d.globalActiveMode === 2) modeText = '\u{1F30D} Global HIGH';
+      sactEl.textContent = modeText;
+    }
+
+    const srtcEl = document.getElementById('srtc');
+    if(srtcEl){
+      srtcEl.textContent = d.rtcPresent ? '\u2705 Present' : '\u274C Not detected';
+      srtcEl.style.color = d.rtcPresent ? '#2E7D32' : '#C62828';
+    }
+
+    const srtcsyncEl = document.getElementById('srtcsync');
+    if(srtcsyncEl){
+      const rtcAge = safeAge(d.rtcSyncAge);
+      srtcsyncEl.textContent = rtcAge >= 0 ? fmtAge(rtcAge) : 'Never';
+    }
+
     const tEl = document.getElementById('srtctemp');
-    if (d.rtcTemp === null || d.rtcTemp === undefined) {
+    if(tEl){
+      if(d.rtcTemp === null || d.rtcTemp === undefined || typeof d.rtcTemp !== 'number' || !isFinite(d.rtcTemp)){
         tEl.textContent = '\u2014';
         tEl.style.color = '#90A4AE';
-    } else {
+      } else {
         tEl.textContent = d.rtcTemp.toFixed(2) + ' \u00B0C';
-        if (d.rtcTemp < 15)       tEl.style.color = '#1565C0';
-        else if (d.rtcTemp < 35)  tEl.style.color = '#2E7D32';
-        else if (d.rtcTemp < 50)  tEl.style.color = '#F9A825';
-        else                       tEl.style.color = '#C62828';
+        if(d.rtcTemp < 0)        tEl.style.color = '#0D47A1';
+        else if(d.rtcTemp < 10)  tEl.style.color = '#1565C0';
+        else if(d.rtcTemp < 20)  tEl.style.color = '#0288D1';
+        else if(d.rtcTemp < 30)  tEl.style.color = '#2E7D32';
+        else if(d.rtcTemp < 40)  tEl.style.color = '#F9A825';
+        else if(d.rtcTemp < 50)  tEl.style.color = '#EF6C00';
+        else                     tEl.style.color = '#C62828';
+      }
     }
-    document.getElementById('ssyncdir').textContent = d.rtcPresent ? 'DS3231 → Internal RTC' : 'Not available';
-    const staStatus = d.staEnabled ? (d.wifiConnected ? '✅ Connected' : '⚠️ Enabled but disconnected') : '❌ Disabled';
-    document.getElementById('stawifi').textContent = staStatus;
-    if(d.staEnabled && d.wifiConnected) document.getElementById('stawifi').style.color='#2E7D32';
-    else if(d.staEnabled) document.getElementById('stawifi').style.color='#F9A825';
-    else document.getElementById('stawifi').style.color='#C62828';
-  }).catch(()=>{});
+
+    const ssyncEl = document.getElementById('ssyncdir');
+    if(ssyncEl){
+      ssyncEl.textContent = (typeof d.syncDirection === 'string' && d.syncDirection) ? d.syncDirection : 'Not available';
+    }
+
+    const stawifiEl = document.getElementById('stawifi');
+    if(stawifiEl){
+      const staStatus = d.staEnabled ? (d.wifiConnected ? '\u2705 Connected' : '\u26A0\uFE0F Enabled but disconnected') : '\u274C Disabled';
+      stawifiEl.textContent = staStatus;
+      if(d.staEnabled && d.wifiConnected) stawifiEl.style.color = '#2E7D32';
+      else if(d.staEnabled) stawifiEl.style.color = '#F9A825';
+      else stawifiEl.style.color = '#C62828';
+    }
+  }).catch(()=>{
+    loadSys._inflight = false;
+    ['sip','sap','shp','sup','srs','stsrc','sauth','stz','sdst','sutc','snt','sbs','sns','sch','smdns','src','sgmt','sdrift','sactmode','srtc','srtcsync','srtctemp','ssyncdir','stawifi'].forEach(id=>{
+      const el = document.getElementById(id);
+      if(el && el.textContent === '\u2026') el.textContent = '\u2014';
+    });
+    const el = document.getElementById('stsrc');
+    if(el && !el.textContent) el.textContent = '\u2014';
+  });
 }
-loadSys();setInterval(loadSys,5000);
+loadSys();
+setInterval(loadSys, 5000);
+
 function rst(){
   if(!confirm('Verify all services without restarting? This will check WiFi, web server, DNS, and mDNS.'))return;
   fetch('/api/reset',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.success)toast('Services verified!');
+    if(d && d.success)toast('Services verified!');
     else toast('Verification failed',false);
   }).catch(()=>toast('Error',false));
 }
+
 function fct(){
   if(!confirm('FACTORY RESET \u2014 ALL settings will be erased. Continue?'))return;
   fetch('/api/factory-reset',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.success)toast('Factory reset complete');
+    if(d && d.success)toast('Factory reset complete');
     else toast('Reset failed',false);
   }).catch(()=>{});
-  setTimeout(()=>window.location.href='/',7000);
+  setTimeout(()=>window.location.reload(),15000);
 }
 </script></body></html>)raw";
 
@@ -2308,18 +3531,44 @@ void processNTPResponse() {
                            (uint32_t)ntpPacketBuffer[43];
             uint64_t ntpSecs64 = (uint64_t)secs;
             uint64_t currentEpoch = getCurrentEpoch();
-            if (currentEpoch > 1577836800ULL) {
+            if (currentEpoch >= 1577836800ULL) {
                 uint64_t currentNtp = currentEpoch + NTP_EPOCH_OFFSET;
                 uint64_t eraBase = currentNtp & ~0xFFFFFFFFULL;
                 uint64_t candidate     = eraBase | (uint64_t)secs;
                 uint64_t candidateNext = candidate + 0x100000000ULL;
                 uint64_t candidatePrev = (eraBase >= 0x100000000ULL) ? (candidate - 0x100000000ULL) : candidate;
-                uint64_t diffCur  = (candidate     > currentNtp) ? (candidate     - currentNtp) : (currentNtp - candidate);
-                uint64_t diffNext = (candidateNext > currentNtp) ? (candidateNext - currentNtp) : (currentNtp - candidateNext);
-                uint64_t diffPrev = (candidatePrev > currentNtp) ? (candidatePrev - currentNtp) : (currentNtp - candidatePrev);
-                ntpSecs64 = candidate;
-                if (diffNext < diffCur && diffNext < diffPrev) ntpSecs64 = candidateNext;
-                else if (diffPrev < diffCur && diffPrev < diffNext) ntpSecs64 = candidatePrev;
+                uint64_t candidates[3] = { candidatePrev, candidate, candidateNext };
+                uint64_t bestNtp = 0;
+                uint64_t bestDiff = UINT64_MAX;
+                for (int ci = 0; ci < 3; ci++) {
+                    uint64_t candNtp = candidates[ci];
+                    uint64_t candUnix = candNtp - NTP_EPOCH_OFFSET;
+                    if (candNtp < NTP_EPOCH_OFFSET) continue;
+                    if (!VALID_UNIX_TIME_64(candUnix)) continue;
+                    uint64_t d = (candNtp > currentNtp) ? (candNtp - currentNtp) : (currentNtp - candNtp);
+                    if (d < bestDiff) {
+                        bestDiff = d;
+                        bestNtp = candNtp;
+                    }
+                }
+                if (bestDiff != UINT64_MAX) {
+                    bool localTimeTrusted = (timeSource == TIME_SOURCE_NTP) ||
+                                            (timeSource == TIME_SOURCE_BROWSER) ||
+                                            (rtcPresent && rtcTimeValid);
+                    if (localTimeTrusted && bestDiff > 31536000ULL) {
+                        ntpUDP.stop();
+                        ntpAsyncStage = 3;
+                        return;
+                    }
+                    ntpSecs64 = bestNtp;
+                } else {
+                    uint64_t unixEra0 = ntpSecs64 - NTP_EPOCH_OFFSET;
+                    uint64_t unixEra1 = unixEra0 + 0x100000000ULL;
+                    if (!VALID_UNIX_TIME_64(unixEra0) &&
+                        (VALID_UNIX_TIME_64(unixEra1) || secs < 0x70000000UL)) {
+                        ntpSecs64 += 0x100000000ULL;
+                    }
+                }
             } else {
                 uint64_t unixEra0 = ntpSecs64 - NTP_EPOCH_OFFSET;
                 uint64_t unixEra1 = unixEra0 + 0x100000000ULL;
@@ -2346,8 +3595,13 @@ void processNTPResponse() {
 void updateNTPSync() {
     switch (ntpAsyncStage) {
         case 0:
-            if (ntpRetryCount < NUM_NTP_SERVERS) {
-                startNTPRequest(NTP_SERVERS[ntpAsyncCurrentServer]);
+            if (ntpRetryCount == 0 && strlen(sysConfig.ntp_server) > 0) {
+                startNTPRequest(sysConfig.ntp_server);
+            } else if (ntpRetryCount <= NUM_NTP_SERVERS) {
+                uint8_t idx = (ntpRetryCount == 0) ? 0 : (ntpRetryCount - 1);
+                if (idx < NUM_NTP_SERVERS) {
+                    startNTPRequest(NTP_SERVERS[idx]);
+                }
             } else {
                 ntpFailCount++;
                 ntpRetryCount = 0;
@@ -2363,9 +3617,7 @@ void updateNTPSync() {
             if (ntpReceived) {
                 syncInternalRTC(ntpResult, TIME_SOURCE_NTP);
                 ntpFailCount = 0;
-                ntpServerIndex = (ntpAsyncCurrentServer + 1) % NUM_NTP_SERVERS;
             }
-            ntpAsyncCurrentServer = (ntpAsyncCurrentServer + 1) % NUM_NTP_SERVERS;
             ntpRetryCount = 0;
             ntpAsyncStage = 0;
             ntpAsyncState = NTP_STATE_IDLE;
@@ -2373,7 +3625,6 @@ void updateNTPSync() {
         case 3:
             ntpUDP.stop();
             ntpRetryCount++;
-            ntpAsyncCurrentServer = (ntpAsyncCurrentServer + 1) % NUM_NTP_SERVERS;
             ntpAsyncStage = 0;
             break;
     }
@@ -2392,12 +3643,11 @@ void tryNTPSync() {
         return;
     }
     unsigned long now = millis();
-    if (!timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) {
+    if (lastNTPAttempt != 0 && !timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) {
         return;
     }
     lastNTPAttempt = now;
     ntpRetryCount = 0;
-    ntpAsyncCurrentServer = ntpServerIndex;
     ntpAsyncStage = 0;
     ntpAsyncState = NTP_STATE_CONNECTING;
 }
@@ -2425,11 +3675,29 @@ void handleBrowserTimeSync() {
         return;
     }
     uint64_t currentEpoch = getCurrentEpoch();
-    if (currentEpoch >= MIN_UNIX_TIME_64) {
+    bool trustCurrentTime = false;
+    unsigned long nowMs = millis();
+    if (timeSource == TIME_SOURCE_NTP && lastNTPSync > 0 &&
+        !timeHasElapsed(nowMs, lastNTPSync, 86400000UL)) {
+        trustCurrentTime = true;
+    }
+    if (timeSource == TIME_SOURCE_RTC && rtcPresent && rtcTimeValid &&
+        lastRTCDSync > 0 &&
+        !timeHasElapsed(nowMs, lastRTCDSync, 86400000UL)) {
+        trustCurrentTime = true;
+    }
+    if (timeSource == TIME_SOURCE_BROWSER && lastBrowserSync > 0 &&
+        !timeHasElapsed(nowMs, lastBrowserSync, 86400000UL)) {
+        trustCurrentTime = true;
+    }
+    bool havePriorAuthority = (rtcPresent && rtcTimeValid) ||
+                              (rtcInitialized && internalEpoch > 0);
+    if ((trustCurrentTime || havePriorAuthority) &&
+        currentEpoch >= MIN_UNIX_TIME_64) {
         uint64_t diff = (browserUtcEpoch > currentEpoch)
             ? (browserUtcEpoch - currentEpoch)
             : (currentEpoch - browserUtcEpoch);
-        if (diff > 86400ULL) {
+        if (diff > 31536000ULL) {
             server.send(400, "application/json",
                 "{\"success\":false,\"error\":\"Epoch differs too much from current time\"}");
             return;
@@ -2445,6 +3713,10 @@ void handleBrowserTimeSync() {
             rtc.adjust(dt);
             rtcTimeValid = true;
             lastRTCDSync = millis();
+        } else {
+            rtcPresent = false;
+            rtcTimeValid = false;
+            saveRTCState();
         }
     } else {
         saveRTCState();
@@ -2452,19 +3724,34 @@ void handleBrowserTimeSync() {
     updateScheduleCache();
     uint64_t localEpoch = getLocalEpoch(browserUtcEpoch);
     struct tm* ti = gmtime64(&localEpoch);
-    char timeStr[20];
+    char timeStr[12];
+    char dateStr[12];
+    char weekdayStr[4] = "";
+    static const char* WD[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     if (ti) {
-        snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
-                 ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
                  ti->tm_hour, ti->tm_min, ti->tm_sec);
+        snprintf(dateStr, sizeof(dateStr), "%02d/%02d/%04d",
+                 ti->tm_mon + 1, ti->tm_mday, ti->tm_year + 1900);
+        if (ti->tm_wday >= 0 && ti->tm_wday <= 6) {
+            strncpy(weekdayStr, WD[ti->tm_wday], 3);
+            weekdayStr[3] = '\0';
+        }
     } else {
-        strcpy(timeStr, "Error");
+        strcpy(timeStr, "--:--:--");
+        strcpy(dateStr, "--/--/----");
     }
     String resp;
     DynamicJsonDocument respDoc(512);
     respDoc["success"] = true;
-    respDoc["utc_epoch"] = (uint32_t)browserUtcEpoch;
+    {
+        char ebuf[24];
+        snprintf(ebuf, sizeof(ebuf), "%llu", (unsigned long long)browserUtcEpoch);
+        respDoc["utc_epoch"] = ebuf;
+    }
     respDoc["local_time"] = timeStr;
+    respDoc["local_date"] = dateStr;
+    respDoc["weekday"] = weekdayStr;
     respDoc["gmt_offset"] = sysConfig.gmt_offset;
     respDoc["time_source"] = "browser";
     respDoc["rtc_present"] = rtcPresent;
@@ -2483,7 +3770,7 @@ void beginWiFiConnect() {
     if (wifiGiveUpUntil != 0 && !isTimeReached(millis(), wifiGiveUpUntil)) return;
     if (wifiConnecting) return;
     if (wifiPausedForScan) return;
-    WiFi.disconnect(true);
+    WiFi.disconnect(false, false);
     delay(100);
     wifiReconnectAttempts++;
     if (WiFi.getMode() != WIFI_AP_STA) {
@@ -2497,7 +3784,7 @@ void beginWiFiConnect() {
 // =============================================================================
 //  SINGLE SCHEDULE ACTIVE CHECK
 // =============================================================================
-inline bool isSingleScheduleSlotActive(uint64_t epoch, uint64_t localEpoch, struct tm* ti,
+inline bool isSingleScheduleSlotActive(uint64_t epoch,
                                        int currentWeekday, int currentMonthDay, int currentMonth, int currentSeconds,
                                        const TimerSchedule& sched, int slot) {
     if (!sched.enabled[slot]) return false;
@@ -2523,8 +3810,8 @@ inline bool isSingleScheduleSlotActive(uint64_t epoch, uint64_t localEpoch, stru
             if (sched.days[slot] & (1 << currentWeekday)) return true;
             return false;
         } else if (cur < stop) {
-            uint64_t checkEpoch = epoch - 86400ULL;
-            uint64_t checkLocalEpoch = getLocalEpoch(checkEpoch);
+            uint64_t prevUtcEpoch = epoch - 86400ULL;
+            uint64_t checkLocalEpoch = getLocalEpoch(prevUtcEpoch);
             struct tm* checkDate = gmtime64(&checkLocalEpoch);
             if (!checkDate) return false;
             if (!(monthMask & (1 << checkDate->tm_mon))) return false;
@@ -2558,7 +3845,7 @@ void updateScheduleCache() {
         }
         bool hasActive = false;
         for (int s = 0; s < 8; s++) {
-            if (isSingleScheduleSlotActive(epoch, localEpoch, ti,
+            if (isSingleScheduleSlotActive(epoch,
                                            currentWeekday, currentMonthDay, currentMonth, cur,
                                            relayConfigs[i].schedule, s)) {
                 hasActive = true;
@@ -2600,7 +3887,7 @@ void processRelaySchedules() {
         }
         bool shouldBeOn = false;
         for (int s = 0; s < 8; s++) {
-            if (isSingleScheduleSlotActive(epoch, localEpoch, ti,
+            if (isSingleScheduleSlotActive(epoch,
                                            currentWeekday, currentMonthDay, currentMonth, cur,
                                            relayConfigs[i].schedule, s)) {
                 shouldBeOn = true;
@@ -2617,7 +3904,6 @@ void processRelaySchedules() {
         } else if (lastRelayOutputs[i] != shouldBeOn) {
             setRelayOutput(i, shouldBeOn);
             lastRelayOutputs[i] = shouldBeOn;
-            lastStateChangeGlobal[i] = now;
         }
     }
 }
@@ -2642,7 +3928,8 @@ void startMDNS() {
         hostname.replace("_", "-");
         String clean;
         for (char c : hostname) {
-            if (isalnum(c) || c == '-') clean += c;
+            unsigned char uc = (unsigned char)c;
+            if (isalnum(uc) || uc == '-') clean += c;
         }
         if (clean.length() > 0) {
             hostname = clean;
@@ -2657,44 +3944,14 @@ void startMDNS() {
         MDNS.addServiceTxt("http", "tcp", "model", "ESP32S3");
         MDNS.addServiceTxt("http", "tcp", "version", "v12");
         MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
-        MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit");
+        MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,tz");
         mdnsStarted = true;
     } else {
         mdnsStarted = false;
     }
 }
-
-void restartMDNS() {
-    healer.liveReconfigureMDNS();
-}
-
-void scheduleMDNSRestart() {
-    mdnsRestartScheduled = true;
-    mdnsRestartPending = millis() + MDNS_RESTART_DELAY;
-}
 String getMDNSHostname() {
     return String(mdnsHostname);
-}
-
-void setMDNSHostname(const char* hostname) {
-    if (hostname && strlen(hostname) > 0 && strlen(hostname) < 32) {
-        String sanitized;
-        for (size_t i = 0; i < strlen(hostname); i++) {
-            char c = tolower(hostname[i]);
-            if (isalnum(c) || c == '-') {
-                sanitized += c;
-            } else if (c == ' ' || c == '_') {
-                sanitized += '-';
-            }
-        }
-        if (sanitized.length() > 0) {
-            strncpy(mdnsHostname, sanitized.c_str(), 31);
-            mdnsHostname[31] = '\0';
-            if (mdnsStarted) {
-                scheduleMDNSRestart();
-            }
-        }
-    }
 }
 
 // =============================================================================
@@ -2703,22 +3960,22 @@ void setMDNSHostname(const char* hostname) {
 void setup() {
     initRTC();
     loadGPIOConfig();
-    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-    for (int i = 0; i < gpioConfig.count; i++) {
-        pinMode(getRelayPin(i), OUTPUT);
-        setRelayOutput(i, false);
-        lastRelayOutputs[i] = false;
-    }
     for (int i = 0; i < MAX_RELAYS; i++) {
         initScheduleDefaults(i);
     }
     loadConfiguration();
     loadExtConfig();
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
     for (int i = 0; i < gpioConfig.count; i++) {
-        if (relayConfigs[i].manualOverride) {
-            setRelayOutput(i, relayConfigs[i].manualState);
-            lastRelayOutputs[i] = relayConfigs[i].manualState;
-        }
+        int pin = getRelayPin(i);
+        if (pin < 0) continue;
+        bool initial = relayConfigs[i].manualOverride ? relayConfigs[i].manualState : false;
+        digitalWrite(pin, isActiveLow(i) ? !initial : initial);
+        pinMode(pin, OUTPUT);
+        setRelayOutput(i, initial);
+        lastRelayOutputs[i] = initial;
+        lastDebouncedStateGlobal[i] = initial;
+        lastStateChangeGlobal[i] = 0;
     }
     bool timeInitialized = false;
     if (loadRTCFromDS3231()) {
@@ -2741,12 +3998,11 @@ void setup() {
     }
     WiFi.mode(WIFI_AP_STA);
     if (extConfig.sta_enabled && strlen(sysConfig.sta_ssid) > 0) {
-        WiFi.disconnect(true);
+        WiFi.disconnect(false, false);
         delay(100);
         WiFi.begin(sysConfig.sta_ssid, sysConfig.sta_password);
         wifiConnecting = true;
         wifiConnectStart = millis();
-        wifiFirstAttempt = true;
     } else if (!extConfig.sta_enabled) {
         WiFi.mode(WIFI_AP);
     }
@@ -2778,7 +4034,6 @@ void setup() {
     updateScheduleCache();
     lastMemoryCleanup = millis();
     lastHeapCheck = millis();
-    lastConnectionActivity = millis();
     lastInternalRTCSave = millis();
 }
 
@@ -2791,9 +4046,11 @@ void loop() {
     dnsServer.processNextRequest();
     static unsigned long lastConnectionCleanup = 0;
     static unsigned long lastHealingCheck = 0;
+    static unsigned long lastDstInvalidate = 0;
     unsigned long now = millis();
-    if (server.client()) {
-        lastConnectionActivity = now;
+    if (timeHasElapsed(now, lastDstInvalidate, DST_CACHE_INVALIDATE_INTERVAL)) {
+        lastDstInvalidate = now;
+        invalidateDstCache();
     }
     if (timeHasElapsed(now, lastConnectionCleanup, 60000)) {
         lastConnectionCleanup = now;
@@ -2816,12 +4073,12 @@ void loop() {
                       !timeHasElapsed(now, lastNTPSync, getNTPInterval() * 2UL);
     if (rtcPresent && rtcTimeValid && rtcInitialized && !ntpIsFresh) {
         if (timeHasElapsed(now, lastRTCDSync, DS3231_SYNC_INTERVAL)) {
-            lastRTCDSync = now;
             if (rtc.begin()) {
                 DateTime nowDS = rtc.now();
                 if (nowDS.year() >= 2020 && nowDS.year() <= 2100) {
                     uint64_t dsEpoch = rtcDateTimeToUint64(nowDS);
                     if (VALID_UNIX_TIME_64(dsEpoch)) {
+                        lastRTCDSync = now;
                         internalEpoch = dsEpoch;
                         driftCompensation = 1.0f;
                         rtcMicrosAtLastSync = micros();
@@ -2829,14 +4086,13 @@ void loop() {
                         timeSource = TIME_SOURCE_RTC;
                     }
                 }
+            } else {
+                rtcPresent = false;
+                rtcTimeValid = false;
             }
         }
     }
     autoSaveInternalRTC();
-    if (mdnsRestartScheduled && isTimeReached(now, mdnsRestartPending)) {
-        mdnsRestartScheduled = false;
-        restartMDNS();
-    }
     if (scanInProgress) {
         if (timeHasElapsed(now, scanStartTime, 10000UL)) {
             WiFi.scanDelete();
@@ -2853,7 +4109,6 @@ void loop() {
             wifiConnected = true;
             wifiReconnectAttempts = 0;
             wifiGiveUpUntil = 0;
-            wifiFirstAttempt = false;
             wifiPausedForScan = false;
             if (ntpAsyncStage == 0 && ntpAsyncState != NTP_STATE_CONNECTING) {
                 lastNTPSync = 0;
@@ -2862,7 +4117,6 @@ void loop() {
         } else if (timeHasElapsed(now, wifiConnectStart, WIFI_CONNECT_TIMEOUT)) {
             wifiConnecting = false;
             wifiConnected = false;
-            wifiFirstAttempt = false;
             if (wifiReconnectAttempts >= MAX_RECONNECT) {
                 wifiGiveUpUntil = now + 300000UL;
                 wifiReconnectAttempts = 0;
@@ -2921,7 +4175,6 @@ void loop() {
         }
         ntpAsyncStage = 0;
         ntpAsyncState = NTP_STATE_IDLE;
-        ntpAsyncCurrentServer = ntpServerIndex;
         ntpRetryCount = 0;
     }
     if (ntpAsyncStage != 0 || ntpAsyncState == NTP_STATE_CONNECTING) {
@@ -2947,6 +4200,12 @@ void initDefaults() {
     sysConfig.gmt_offset      = 28800;
     sysConfig.daylight_offset = 0;
     sysConfig.last_rtc_epoch  = 0;
+    strcpy(sysConfig.tz_name, "Asia/Manila");
+    sysConfig.tz_rule_id      = findTzByName("Asia/Manila");
+    if (sysConfig.tz_rule_id >= TZ_TABLE_SIZE) sysConfig.tz_rule_id = 0;
+    sysConfig.tz_auto_dst     = 1;
+    sysConfig.tz_reserved[0]  = 0;
+    sysConfig.tz_reserved[1]  = 0;
     for (int i = 0; i < MAX_RELAYS; i++) {
         initScheduleDefaults(i);
     }
@@ -2984,17 +4243,6 @@ void loadConfiguration() {
     if (!valid) {
         initDefaults();
     }
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        for (int s = 0; s < 8; s++) {
-            if (relayConfigs[i].schedule.monthDays[s] == 0) {
-                relayConfigs[i].schedule.monthDays[s] = 0x7FFFFFFFUL;
-            }
-        }
-    }
-    strncpy(ap_ssid, sysConfig.ap_ssid, sizeof(ap_ssid) - 1);
-    ap_ssid[sizeof(ap_ssid) - 1] = '\0';
-    strncpy(ap_password, sysConfig.ap_password, sizeof(ap_password) - 1);
-    ap_password[sizeof(ap_password) - 1] = '\0';
 }
 
 void saveConfiguration() {
@@ -3065,6 +4313,20 @@ void setupWebServer() {
     server.on("/api/ntp",      HTTP_GET,  handleGetNTP);
     server.on("/api/ntp",      HTTP_POST, handleSaveNTP);
     server.on("/api/ntp/sync", HTTP_POST, handleSyncNTP);
+    server.on("/api/timezones", HTTP_GET, []() {
+        DynamicJsonDocument doc(4096);
+        JsonArray zones = doc.createNestedArray("timezones");
+        for (uint8_t i = 0; i < TZ_TABLE_SIZE; i++) {
+            JsonObject z = zones.createNestedObject();
+            z["id"]     = i;
+            z["name"]   = TZ_TABLE[i].name;
+            z["offset"] = TZ_TABLE[i].std_offset;
+            z["dst"]    = (TZ_TABLE[i].dst_offset != 0);
+        }
+        String resp;
+        serializeJson(doc, resp);
+        server.send(200, "application/json", resp);
+    });
     server.on("/api/ap", HTTP_GET,  handleGetAP);
     server.on("/api/ap", HTTP_POST, handleSaveAP);
     server.on("/api/gpio",                  HTTP_GET,  handleGetGPIOConfig);
@@ -3077,38 +4339,6 @@ void setupWebServer() {
         "{\"mode\":" + String(extConfig.global_active_mode) + "}");
     });
     server.on("/api/gpio/global-mode",      HTTP_POST, handleGlobalActiveMode);
-    server.on("/api/mdns", HTTP_GET, []() {
-    String resp = "{\"hostname\":\"" + getMDNSHostname() +
-                      "\",\"started\":" + String(mdnsStarted ? "true" : "false") +
-                      ",\"url\":\"http://" + getMDNSHostname() + ".local\"}";
-    server.send(200, "application/json", resp);
-    });
-    server.on("/api/mdns", HTTP_POST, []() {
-        if (!server.hasArg("plain")) {
-            server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
-            return;
-        }
-        StaticJsonDocument<128> doc;
-        DeserializationError err = deserializeJson(doc, server.arg("plain"));
-        if (err) {
-            server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
-            return;
-        }
-        const char* hostname = doc["hostname"];
-        if (hostname && strlen(hostname) > 0 && strlen(hostname) < 32) {
-            setMDNSHostname(hostname);
-            preferences.begin(NVS_NAMESPACE, false);
-            preferences.putString("mdns_host", String(mdnsHostname));
-            preferences.end();
-            server.send(200, "application/json", "{\"success\":true,\"hostname\":\"" + getMDNSHostname() + "\"}");
-        } else {
-            server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid hostname\"}");
-        }
-    });
-    server.on("/api/mdns/restart", HTTP_POST, []() {
-        restartMDNS();
-        server.send(200, "application/json", "{\"success\":true}");
-    });
     server.on("/api/system",        HTTP_GET,  handleGetSystem);
     server.on("/api/reset",         HTTP_POST, handleReset);
     server.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
@@ -3150,41 +4380,42 @@ void setupWebServer() {
 //  API HANDLERS
 // =============================================================================
 void handleGetRelays() {
-    lastConnectionActivity = millis();
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
     server.sendContent("[");
-    for (int i = 0; i < gpioConfig.count; i++) {
-        if (i > 0) server.sendContent(",");
+    if (gpioConfig.count > 0) {
         DynamicJsonDocument relayDoc(4096);
-        relayDoc["state"] = lastRelayOutputs[i];
-        relayDoc["manual"] = relayConfigs[i].manualOverride;
-        relayDoc["name"] = String(relayConfigs[i].name);
-        relayDoc["pin"] = getRelayPin(i);
-        JsonArray schedules = relayDoc.createNestedArray("schedules");
-        for (int s = 0; s < 8; s++) {
-            JsonObject sch = schedules.createNestedObject();
-            sch["startHour"] = relayConfigs[i].schedule.startHour[s];
-            sch["startMinute"] = relayConfigs[i].schedule.startMinute[s];
-            sch["startSecond"] = relayConfigs[i].schedule.startSecond[s];
-            sch["stopHour"] = relayConfigs[i].schedule.stopHour[s];
-            sch["stopMinute"] = relayConfigs[i].schedule.stopMinute[s];
-            sch["stopSecond"] = relayConfigs[i].schedule.stopSecond[s];
-            sch["enabled"] = relayConfigs[i].schedule.enabled[s];
-            sch["days"] = relayConfigs[i].schedule.days[s];
-            sch["monthDays"] = relayConfigs[i].schedule.monthDays[s];
-            sch["monthMask"] = relayConfigs[i].schedule.monthMask[s];
+        for (int i = 0; i < gpioConfig.count; i++) {
+            relayDoc.clear();
+            if (i > 0) server.sendContent(",");
+            relayDoc["state"] = lastRelayOutputs[i];
+            relayDoc["manual"] = relayConfigs[i].manualOverride;
+            relayDoc["name"] = String(relayConfigs[i].name);
+            relayDoc["pin"] = getRelayPin(i);
+            JsonArray schedules = relayDoc.createNestedArray("schedules");
+            for (int s = 0; s < 8; s++) {
+                JsonObject sch = schedules.createNestedObject();
+                sch["startHour"] = relayConfigs[i].schedule.startHour[s];
+                sch["startMinute"] = relayConfigs[i].schedule.startMinute[s];
+                sch["startSecond"] = relayConfigs[i].schedule.startSecond[s];
+                sch["stopHour"] = relayConfigs[i].schedule.stopHour[s];
+                sch["stopMinute"] = relayConfigs[i].schedule.stopMinute[s];
+                sch["stopSecond"] = relayConfigs[i].schedule.stopSecond[s];
+                sch["enabled"] = relayConfigs[i].schedule.enabled[s];
+                sch["days"] = relayConfigs[i].schedule.days[s];
+                sch["monthDays"] = relayConfigs[i].schedule.monthDays[s];
+                sch["monthMask"] = relayConfigs[i].schedule.monthMask[s];
+            }
+            String chunk;
+            serializeJson(relayDoc, chunk);
+            server.sendContent(chunk);
+            yield();
         }
-        String chunk;
-        serializeJson(relayDoc, chunk);
-        server.sendContent(chunk);
-        yield();
     }
     server.sendContent("]");
 }
 
 void handleManualControl() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3195,15 +4426,27 @@ void handleManualControl() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>() ||
+        !doc.containsKey("state") || !doc["state"].is<bool>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay/state\"}");
+        return;
+    }
     int relay = doc["relay"];
     bool state = doc["state"];
     if (relay >= 0 && relay < gpioConfig.count) {
+        bool needsSave = (!relayConfigs[relay].manualOverride) ||
+                         (relayConfigs[relay].manualState != state);
         relayConfigs[relay].manualOverride = true;
         relayConfigs[relay].manualState    = state;
         scheduleActiveCache[relay] = false;
         setRelayOutput(relay, state);
         lastRelayOutputs[relay] = state;
-        saveConfiguration();
+        lastDebouncedStateGlobal[relay] = state;
+        lastStateChangeGlobal[relay] = millis();
+        if (needsSave) {
+            saveConfiguration();
+        }
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
@@ -3211,7 +4454,6 @@ void handleManualControl() {
 }
 
 void handleResetManual() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3222,10 +4464,20 @@ void handleResetManual() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay\"}");
+        return;
+    }
     int relay = doc["relay"];
     if (relay >= 0 && relay < gpioConfig.count) {
         relayConfigs[relay].manualOverride = false;
         updateScheduleCache();
+        bool targetState = scheduleActiveCache[relay];
+        setRelayOutput(relay, targetState);
+        lastRelayOutputs[relay] = targetState;
+        lastDebouncedStateGlobal[relay] = targetState;
+        lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
         server.send(200, "application/json", "{\"success\":true}");
     } else {
@@ -3234,7 +4486,6 @@ void handleResetManual() {
 }
 
 void handleSaveRelay() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3245,21 +4496,37 @@ void handleSaveRelay() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay\"}");
+        return;
+    }
     int relay = doc["relay"];
     if (relay < 0 || relay >= gpioConfig.count) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
+        return;
+    }
+    if (!doc.containsKey("schedules") || !doc["schedules"].is<JsonArray>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid schedules\"}");
         return;
     }
     JsonArray schedules = doc["schedules"].as<JsonArray>();
     int s = 0;
     for (JsonObject sch : schedules) {
         if (s >= 8) break;
-        uint8_t sh = sch["startHour"]   | 0; if (sh > 23) sh = 23;
-        uint8_t sm = sch["startMinute"] | 0; if (sm > 59) sm = 59;
-        uint8_t ss = sch["startSecond"] | 0; if (ss > 59) ss = 59;
-        uint8_t eh = sch["stopHour"]    | 0; if (eh > 23) eh = 23;
-        uint8_t em = sch["stopMinute"]  | 0; if (em > 59) em = 59;
-        uint8_t es = sch["stopSecond"]  | 0; if (es > 59) es = 59;
+        int32_t shRaw = sch["startHour"]   | 0;
+        int32_t smRaw = sch["startMinute"] | 0;
+        int32_t ssRaw = sch["startSecond"] | 0;
+        int32_t ehRaw = sch["stopHour"]    | 0;
+        int32_t emRaw = sch["stopMinute"]  | 0;
+        int32_t esRaw = sch["stopSecond"]  | 0;
+        uint8_t sh = (uint8_t)((shRaw < 0) ? 0 : (shRaw > 23) ? 23 : shRaw);
+        uint8_t sm = (uint8_t)((smRaw < 0) ? 0 : (smRaw > 59) ? 59 : smRaw);
+        uint8_t ss = (uint8_t)((ssRaw < 0) ? 0 : (ssRaw > 59) ? 59 : ssRaw);
+        uint8_t eh = (uint8_t)((ehRaw < 0) ? 0 : (ehRaw > 23) ? 23 : ehRaw);
+        uint8_t em = (uint8_t)((emRaw < 0) ? 0 : (emRaw > 59) ? 59 : emRaw);
+        uint8_t es = (uint8_t)((esRaw < 0) ? 0 : (esRaw > 59) ? 59 : esRaw);
         relayConfigs[relay].schedule.startHour[s]   = sh;
         relayConfigs[relay].schedule.startMinute[s] = sm;
         relayConfigs[relay].schedule.startSecond[s] = ss;
@@ -3276,8 +4543,10 @@ void handleSaveRelay() {
         } else {
             relayConfigs[relay].schedule.days[s] = DAY_ALL;
         }
-        uint32_t rawMonthDays = sch["monthDays"] | 0;
-        if (rawMonthDays == 0) rawMonthDays = 0x7FFFFFFFUL;
+        uint32_t rawMonthDays = 0x7FFFFFFFUL;
+        if (sch.containsKey("monthDays") && sch["monthDays"].is<uint32_t>()) {
+            rawMonthDays = sch["monthDays"].as<uint32_t>();
+        }
         relayConfigs[relay].schedule.monthDays[s] = rawMonthDays & 0x7FFFFFFFUL;
         if (sch.containsKey("monthMask")) {
             relayConfigs[relay].schedule.monthMask[s] = sch["monthMask"].as<uint16_t>() & 0x0FFF;
@@ -3304,7 +4573,6 @@ void handleSaveRelay() {
 }
 
 void handleRelayName() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3315,11 +4583,36 @@ void handleRelayName() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay\"}");
+        return;
+    }
     int relay = doc["relay"];
     const char* name = doc["name"];
     if (relay >= 0 && relay < gpioConfig.count && name) {
-        strncpy(relayConfigs[relay].name, name, 15);
-        relayConfigs[relay].name[15] = '\0';
+        size_t nlen = strlen(name);
+        if (nlen == 0) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Name cannot be empty\"}");
+            return;
+        }
+        if (nlen > 15) {
+            nlen = 15;
+            while (nlen > 0 && (((uint8_t)name[nlen]) & 0xC0) == 0x80) {
+                nlen--;
+            }
+            if (nlen == 0) {
+                const char* def = "Relay";
+                memcpy(relayConfigs[relay].name, def, strlen(def));
+                relayConfigs[relay].name[strlen(def)] = '\0';
+                saveConfiguration();
+                server.send(200, "application/json", "{\"success\":true}");
+                return;
+            }
+        }
+        memcpy(relayConfigs[relay].name, name, nlen);
+        relayConfigs[relay].name[nlen] = '\0';
         saveConfiguration();
         server.send(200, "application/json", "{\"success\":true}");
     } else {
@@ -3328,16 +4621,23 @@ void handleRelayName() {
 }
 
 void handleGetTime() {
-    lastConnectionActivity = millis();
     String ts = "--:--:--";
+    String ds = "--/--/----";
+    String ws = "";
     uint64_t utcEp = getCurrentEpoch();
-    if (utcEp > MIN_UNIX_TIME_64) {
+    if (utcEp >= MIN_UNIX_TIME_64) {
         uint64_t localEp = getLocalEpoch(utcEp);
         struct tm* t = gmtime64(&localEp);
         if (t) {
             char buf[12];
             sprintf(buf, "%02d:%02d:%02d", t->tm_hour, t->tm_min, t->tm_sec);
             ts = buf;
+            char dbuf[13];
+            sprintf(dbuf, "%02d/%02d/%04d", t->tm_mon + 1, t->tm_mday,
+                    t->tm_year + 1900);
+            ds = dbuf;
+            static const char* WD[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+            if (t->tm_wday >= 0 && t->tm_wday <= 6) ws = WD[t->tm_wday];
         }
     }
     String timeSourceStr = "none";
@@ -3347,18 +4647,50 @@ void handleGetTime() {
     unsigned long rtcSyncAge = (lastRTCDSync > 0)
         ? (millis() - lastRTCDSync) / 1000UL
         : 0xFFFFFFFFUL;
-    String resp = "{\"time\":\"" + ts + "\",\"wifi\":" +
+    unsigned long ntpSyncAge = (lastNTPSync > 0)
+        ? (millis() - lastNTPSync) / 1000UL
+        : 0xFFFFFFFFUL;
+    String authorityStr = "none";
+    if (utcEp < MIN_UNIX_TIME_64) {
+        authorityStr = "none";
+    } else if (timeSource == TIME_SOURCE_NTP && lastNTPSync > 0 &&
+               !timeHasElapsed(millis(), lastNTPSync, getNTPInterval() * 2UL)) {
+        authorityStr = "ntp";
+    } else if (timeSource == TIME_SOURCE_BROWSER && lastBrowserSync > 0 &&
+               !timeHasElapsed(millis(), lastBrowserSync, 86400000UL)) {
+        authorityStr = "browser";
+    } else if (rtcPresent && rtcTimeValid) {
+        authorityStr = "ds3231";
+    } else if (rtcInitialized && internalEpoch > 0) {
+        authorityStr = "internal_rtc";
+    } else {
+        authorityStr = "none";
+    }
+    bool authorityStale = false;
+    if (authorityStr == "ntp" && ntpSyncAge != 0xFFFFFFFFUL &&
+        timeHasElapsed(millis(), lastNTPSync, getNTPInterval())) {
+        authorityStale = true;
+    }
+    int32_t dstOff = (utcEp >= MIN_UNIX_TIME_64) ? currentDstOffset(utcEp) : 0;
+    bool dstOn = (dstOff != 0);
+    String tzName = String(sysConfig.tz_name);
+    String resp = "{\"time\":\"" + ts + "\",\"date\":\"" + ds + "\",\"weekday\":\"" + ws + "\",\"wifi\":" +
                   String(wifiConnected ? "true" : "false") + ",\"ntp\":" +
                   String((timeSource == TIME_SOURCE_NTP) ? "true" : "false") +
                   ",\"timeSource\":\"" + timeSourceStr +
-                  "\",\"rtcPresent\":" + String(rtcPresent ? "true" : "false") +
+                  "\",\"authority\":\"" + authorityStr +
+                  "\",\"authorityStale\":" + String(authorityStale ? "true" : "false") +
+                  ",\"rtcPresent\":" + String(rtcPresent ? "true" : "false") +
                   ",\"rtcSynced\":" + String(rtcTimeValid ? "true" : "false") +
-                  ",\"rtcSyncAge\":" + String(rtcSyncAge) + "}";
+                  ",\"rtcSyncAge\":" + String(rtcSyncAge) +
+                  ",\"ntpSyncAge\":" + String(ntpSyncAge) +
+                  ",\"dstActive\":" + String(dstOn ? "true" : "false") +
+                  ",\"dstOffset\":" + String(dstOff) +
+                  ",\"tzName\":\"" + tzName + "\"}";
     server.send(200, "application/json", resp);
 }
 
 void handleGetWiFi() {
-    lastConnectionActivity = millis();
     DynamicJsonDocument doc(384);
     doc["ssid"] = sysConfig.sta_ssid;
     doc["connected"] = wifiConnected;
@@ -3371,7 +4703,6 @@ void handleGetWiFi() {
 }
 
 void handleSaveWiFi() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3431,14 +4762,13 @@ void handleSaveWiFi() {
         saveConfiguration();
         if (extConfig.sta_enabled && (ssidChanged || passChanged)) {
             wifiPausedForScan = false;
-            WiFi.disconnect(true);
+            WiFi.disconnect(false, false);
             delay(500);
             wifiConnected = false;
             wifiConnecting = true;
             wifiConnectStart = millis();
             wifiReconnectAttempts = 0;
             wifiGiveUpUntil = 0;
-            wifiFirstAttempt = true;
             if (WiFi.getMode() != WIFI_AP_STA) {
                 WiFi.mode(WIFI_AP_STA);
             }
@@ -3451,7 +4781,6 @@ void handleSaveWiFi() {
 }
 
 void handleWiFiScanStart() {
-    lastConnectionActivity = millis();
     if (!extConfig.sta_enabled) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"WiFi station is disabled\"}");
         return;
@@ -3472,7 +4801,6 @@ void handleWiFiScanStart() {
 }
 
 void handleWiFiScanResults() {
-    lastConnectionActivity = millis();
     if (scanInProgress) {
         int n = WiFi.scanComplete();
         if (n == WIFI_SCAN_RUNNING) {
@@ -3508,62 +4836,126 @@ void handleWiFiScanResults() {
 }
 
 void handleGetNTP() {
-    lastConnectionActivity = millis();
-    DynamicJsonDocument doc(256);
+    DynamicJsonDocument doc(512);
     doc["ntpServer"] = sysConfig.ntp_server;
     doc["gmtOffset"] = sysConfig.gmt_offset;
     doc["daylightOffset"] = sysConfig.daylight_offset;
     doc["syncHours"] = extConfig.ntp_sync_hours;
     doc["globalActiveMode"] = extConfig.global_active_mode;
+    doc["tzName"] = sysConfig.tz_name;
+    doc["tzRuleId"] = sysConfig.tz_rule_id;
+    doc["tzAutoDst"] = sysConfig.tz_auto_dst ? 1 : 0;
+    uint64_t now = getCurrentEpoch();
+    int32_t dstOff = (now >= MIN_UNIX_TIME_64) ? currentDstOffset(now) : 0;
+    doc["dstOffset"] = dstOff;
+    doc["dstActive"] = (dstOff != 0);
     String resp;
     serializeJson(doc, resp);
     server.send(200, "application/json", resp);
 }
 
 void handleSaveNTP() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
     }
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<384> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
-    bool changed = false;
-    if (doc.containsKey("ntpServer")) {
+    bool hasNtpServer = doc.containsKey("ntpServer");
+    bool hasTzName    = doc.containsKey("tzName");
+    bool hasGmtOffset = doc.containsKey("gmtOffset") && !hasTzName;
+    bool hasDstOffset = doc.containsKey("daylightOffset") && !hasTzName;
+    bool hasSyncHours = doc.containsKey("syncHours");
+    if (hasNtpServer) {
         const char* srv = doc["ntpServer"];
         if (!srv || strlen(srv) == 0 || strlen(srv) >= 48) {
             server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid NTP server\"}");
             return;
         }
-        strncpy(sysConfig.ntp_server, srv, 47);
+    }
+    uint8_t newTzId = 0;
+    const char* newTzName = nullptr;
+    if (hasTzName) {
+        newTzName = doc["tzName"];
+        if (!newTzName || strlen(newTzName) == 0 || strlen(newTzName) >= 32) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Invalid timezone name\"}");
+            return;
+        }
+        if (strcmp(newTzName, "Manual") != 0) {
+            newTzId = findTzByName(newTzName);
+            if (newTzId >= TZ_TABLE_SIZE) {
+                server.send(400, "application/json",
+                    "{\"success\":false,\"error\":\"Unknown timezone\"}");
+                return;
+            }
+        } else {
+            newTzId = TZ_TABLE_SIZE;
+        }
+    }
+    int32_t newGmtOffset = 0;
+    if (hasGmtOffset) {
+        newGmtOffset = doc["gmtOffset"] | 0;
+        if (newGmtOffset > 50400) newGmtOffset = 50400;
+        if (newGmtOffset < -50400) newGmtOffset = -50400;
+    }
+    int32_t newDstOffset = 0;
+    if (hasDstOffset) {
+        newDstOffset = doc["daylightOffset"] | 0;
+        if (newDstOffset > 7200) newDstOffset = 7200;
+        if (newDstOffset < -7200) newDstOffset = -7200;
+    }
+    uint8_t newSyncHours = 0;
+    if (hasSyncHours) {
+        int32_t syncHoursRaw = doc["syncHours"] | 0;
+        if (syncHoursRaw < 1 || syncHoursRaw > 24) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"syncHours must be 1-24\"}");
+            return;
+        }
+        newSyncHours = (uint8_t)syncHoursRaw;
+    }
+    bool changed = false;
+    bool tzChanged = false;
+    if (hasNtpServer) {
+        strncpy(sysConfig.ntp_server, doc["ntpServer"], 47);
         sysConfig.ntp_server[47] = '\0';
         changed = true;
     }
-    if (doc.containsKey("gmtOffset")) {
-        int32_t gmt = doc["gmtOffset"] | 0;
-        if (gmt > 50400) gmt = 50400;
-        if (gmt < -50400) gmt = -50400;
-        sysConfig.gmt_offset = gmt;
-        changed = true;
-    }
-    if (doc.containsKey("daylightOffset")) {
-        int32_t dst = doc["daylightOffset"] | 0;
-        if (dst > 7200) dst = 7200;
-        if (dst < -7200) dst = -7200;
-        sysConfig.daylight_offset = dst;
-        changed = true;
-    }
-    if (doc.containsKey("syncHours")) {
-        uint8_t h = doc["syncHours"];
-        if (h < 1 || h > 24) {
-            server.send(400, "application/json", "{\"success\":false,\"error\":\"syncHours must be 1-24\"}");
-            return;
+    if (newTzName) {
+        strncpy(sysConfig.tz_name, newTzName, 31);
+        sysConfig.tz_name[31] = '\0';
+        if (newTzId < TZ_TABLE_SIZE) {
+            sysConfig.tz_rule_id  = newTzId;
+            sysConfig.gmt_offset  = TZ_TABLE[newTzId].std_offset;
+            sysConfig.daylight_offset = 0;
+            sysConfig.tz_auto_dst = 1;
+        } else {
+            sysConfig.tz_rule_id  = TZ_TABLE_SIZE;
+            sysConfig.tz_auto_dst = 0;
+            sysConfig.daylight_offset = 0;
         }
-        extConfig.ntp_sync_hours = h;
+        changed = true;
+        tzChanged = true;
+    }
+    if (hasGmtOffset) {
+        sysConfig.gmt_offset = newGmtOffset;
+        strcpy(sysConfig.tz_name, "Manual");
+        sysConfig.tz_auto_dst = 0;
+        changed = true;
+        tzChanged = true;
+    }
+    if (hasDstOffset) {
+        sysConfig.daylight_offset = newDstOffset;
+        changed = true;
+        tzChanged = true;
+    }
+    if (hasSyncHours) {
+        extConfig.ntp_sync_hours = newSyncHours;
         saveExtConfig();
         changed = true;
     }
@@ -3572,11 +4964,21 @@ void handleSaveNTP() {
         return;
     }
     saveConfiguration();
+    if (tzChanged) {
+        invalidateDstCache();
+        updateScheduleCache();
+    }
+    if (hasNtpServer) {
+        ntpAsyncStage = 0;
+        ntpAsyncState = NTP_STATE_IDLE;
+        ntpRetryCount = 0;
+        lastNTPSync = 0;
+        lastNTPAttempt = 0;
+    }
     server.send(200, "application/json", "{\"success\":true}");
 }
 
 void handleSyncNTP() {
-    lastConnectionActivity = millis();
     if (!wifiConnected || !extConfig.sta_enabled) {
         server.send(400, "application/json",
             "{\"success\":false,\"error\":\"WiFi not connected or station disabled\"}");
@@ -3593,7 +4995,6 @@ void handleSyncNTP() {
 }
 
 void handleGetAP() {
-    lastConnectionActivity = millis();
     DynamicJsonDocument doc(256);
     doc["ap_ssid"] = sysConfig.ap_ssid;
     doc["ap_password"] = "";
@@ -3605,12 +5006,11 @@ void handleGetAP() {
 }
 
 void handleSaveAP() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
     }
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
@@ -3626,8 +5026,14 @@ void handleSaveAP() {
         ssidChanged = (strcmp(sysConfig.ap_ssid, ssid) != 0);
         strncpy(sysConfig.ap_ssid, ssid, 31);
         sysConfig.ap_ssid[31] = '\0';
-        strncpy(ap_ssid, sysConfig.ap_ssid, sizeof(ap_ssid) - 1);
-        ap_ssid[sizeof(ap_ssid) - 1] = '\0';
+    } else if (ssid && strlen(ssid) == 0) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"SSID cannot be empty\"}");
+        return;
+    } else if (ssid && strlen(ssid) >= 32) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"SSID must be 31 characters or less\"}");
+        return;
     }
     if (pw) {
         size_t pwLen = strlen(pw);
@@ -3635,14 +5041,15 @@ void handleSaveAP() {
             if (doc.containsKey("ap_password")) {
                 passChanged = (sysConfig.ap_password[0] != '\0');
                 sysConfig.ap_password[0] = '\0';
-                ap_password[0] = '\0';
             }
         } else if (pwLen >= 8 && pwLen <= 31) {
             passChanged = (strcmp(sysConfig.ap_password, pw) != 0);
             strncpy(sysConfig.ap_password, pw, 31);
             sysConfig.ap_password[31] = '\0';
-            strncpy(ap_password, sysConfig.ap_password, sizeof(ap_password) - 1);
-            ap_password[sizeof(ap_password) - 1] = '\0';
+        } else if (pwLen > 31) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Password must be 31 characters or less\"}");
+            return;
         } else {
             server.send(400, "application/json",
                 "{\"success\":false,\"error\":\"Password must be 8-31 characters or empty\"}");
@@ -3650,8 +5057,14 @@ void handleSaveAP() {
         }
     }
     if (doc.containsKey("ap_channel")) {
-        uint8_t ch = doc["ap_channel"];
-        if (ch >= 1 && ch <= 13 && ch != extConfig.ap_channel) {
+        int chRaw = doc["ap_channel"] | 0;
+        if (chRaw < 1 || chRaw > 13) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Channel must be 1-13\"}");
+            return;
+        }
+        uint8_t ch = (uint8_t)chRaw;
+        if (ch != extConfig.ap_channel) {
             extConfig.ap_channel = ch;
             channelChanged = true;
         }
@@ -3663,20 +5076,29 @@ void handleSaveAP() {
             hiddenChanged = true;
         }
     }
-    saveConfiguration();
-    saveExtConfig();
+    if (ssidChanged || passChanged) saveConfiguration();
+    if (channelChanged || hiddenChanged) saveExtConfig();
     bool needsRestart = ssidChanged || passChanged || channelChanged || hiddenChanged;
     if (needsRestart) {
-        healer.restartAPIfNeeded(true);
         server.send(200, "application/json", "{\"success\":true,\"restarted\":true}");
+        server.client().flush();
+        delay(200);
+        yield();
+        server.client().flush();
+        delay(1200);
+        yield();
+        server.client().flush();
+        healer.restartAPIfNeeded(true);
     } else {
         server.send(200, "application/json", "{\"success\":true,\"restarted\":false}");
     }
 }
 
 void handleGetSystem() {
-    lastConnectionActivity = millis();
-    DynamicJsonDocument doc(2048);
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
+    DynamicJsonDocument doc(3072);
     doc["ip"] = WiFi.localIP().toString();
     doc["ap_ip"] = WiFi.softAPIP().toString();
     doc["uptime"] = (uint64_t)(esp_timer_get_time() / 1000000ULL);
@@ -3687,8 +5109,40 @@ void handleGetSystem() {
     String timeSourceStr = "None";
     if (timeSource == TIME_SOURCE_NTP) timeSourceStr = "NTP";
     else if (timeSource == TIME_SOURCE_BROWSER) timeSourceStr = "Browser";
-    else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = "RTC";
+    else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = rtcPresent ? "DS3231" : "Internal RTC";
     doc["timeSource"] = timeSourceStr;
+    uint64_t _authNowEp = getCurrentEpoch();
+    String authorityStr = "none";
+    bool authorityStale = false;
+    if (_authNowEp < MIN_UNIX_TIME_64) {
+        authorityStr = "none";
+    } else if (timeSource == TIME_SOURCE_NTP && lastNTPSync > 0 &&
+               !timeHasElapsed(millis(), lastNTPSync, getNTPInterval() * 2UL)) {
+        authorityStr = "ntp";
+        if (timeHasElapsed(millis(), lastNTPSync, getNTPInterval())) authorityStale = true;
+    } else if (timeSource == TIME_SOURCE_BROWSER && lastBrowserSync > 0 &&
+               !timeHasElapsed(millis(), lastBrowserSync, 86400000UL)) {
+        authorityStr = "browser";
+    } else if (rtcPresent && rtcTimeValid) {
+        authorityStr = "ds3231";
+    } else if (rtcInitialized && internalEpoch > 0) {
+        authorityStr = "internal_rtc";
+    } else {
+        authorityStr = "none";
+    }
+    doc["authority"] = authorityStr;
+    doc["authorityStale"] = authorityStale;
+    if (timeSource == TIME_SOURCE_NTP) {
+        doc["syncDirection"] = rtcPresent ? "NTP \u2192 RTC \u2192 DS3231" : "NTP \u2192 Internal RTC";
+    } else if (timeSource == TIME_SOURCE_BROWSER) {
+        doc["syncDirection"] = rtcPresent ? "Browser \u2192 RTC \u2192 DS3231" : "Browser \u2192 Internal RTC";
+    } else if (timeSource == TIME_SOURCE_RTC && rtcPresent) {
+        doc["syncDirection"] = "DS3231 \u2192 Internal RTC";
+    } else if (timeSource == TIME_SOURCE_RTC && !rtcPresent) {
+        doc["syncDirection"] = "Internal RTC (NVS)";
+    } else {
+        doc["syncDirection"] = "None";
+    }
     doc["ntpServer"] = sysConfig.ntp_server;
     doc["ntpSyncAge"] = lastNTPSync > 0 ? (unsigned long)((millis() - lastNTPSync) / 1000UL) : (unsigned long)0xFFFFFFFF;
     doc["browserSyncAge"] = lastBrowserSync > 0 ? (unsigned long)((millis() - lastBrowserSync) / 1000UL) : (unsigned long)0xFFFFFFFF;
@@ -3697,7 +5151,19 @@ void handleGetSystem() {
     doc["wifiSSID"] = sysConfig.sta_ssid;
     doc["rssi"] = wifiConnected ? (int)WiFi.RSSI() : 0;
     doc["version"] = EEPROM_VERSION;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && defined(ESP_ARDUINO_VERSION_MINOR)
+  #if (ESP_ARDUINO_VERSION_MAJOR > 2) || \
+      (ESP_ARDUINO_VERSION_MAJOR == 2 && ESP_ARDUINO_VERSION_MINOR >= 1)
+    {
+        const char* cm = ESP.getChipModel();
+        doc["chipModel"] = (cm && cm[0]) ? cm : "ESP32S3";
+    }
+  #else
     doc["chipModel"] = "ESP32S3";
+  #endif
+#else
+    doc["chipModel"] = "ESP32S3";
+#endif
     doc["mdnsHostname"] = getMDNSHostname();
     doc["mdnsStarted"] = mdnsStarted;
     doc["relayCount"] = gpioConfig.count;
@@ -3707,6 +5173,12 @@ void handleGetSystem() {
     doc["globalActiveMode"] = extConfig.global_active_mode;
     doc["rtcPresent"] = rtcPresent;
     doc["staEnabled"] = extConfig.sta_enabled ? true : false;
+    doc["tzName"] = sysConfig.tz_name;
+    doc["tzAutoDst"] = sysConfig.tz_auto_dst ? 1 : 0;
+    uint64_t nowEp = getCurrentEpoch();
+    int32_t dstOff = (nowEp >= MIN_UNIX_TIME_64) ? currentDstOffset(nowEp) : 0;
+    doc["dstActive"] = (dstOff != 0);
+    doc["dstOffset"] = dstOff;
     float rtcTempVal = getRTCTemperature();
     if (isnan(rtcTempVal)) {
         doc["rtcTemp"] = nullptr;
@@ -3719,13 +5191,11 @@ void handleGetSystem() {
 }
 
 void handleReset() {
-    lastConnectionActivity = millis();
     server.send(200, "application/json", "{\"success\":true,\"message\":\"Performing live service verification...\"}");
     healer.performTargetedRecovery();
 }
 
 void handleFactoryReset() {
-    lastConnectionActivity = millis();
     server.send(200, "application/json",
         "{\"success\":true,\"message\":\"Factory reset complete. Device will restart with default settings.\"}");
     server.client().flush();
@@ -3741,7 +5211,6 @@ void handleFactoryReset() {
 //  GPIO MANAGEMENT HANDLERS
 // =============================================================================
 void handleGetGPIOConfig() {
-    lastConnectionActivity = millis();
     DynamicJsonDocument doc(2048);
     doc["count"] = gpioConfig.count;
     doc["maxRelays"] = MAX_RELAYS;
@@ -3761,7 +5230,6 @@ void handleGetGPIOConfig() {
 }
 
 void handleSaveGPIOConfig() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3772,8 +5240,16 @@ void handleSaveGPIOConfig() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("pins") || !doc["pins"].is<JsonArray>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid pins array\"}");
+        return;
+    }
     JsonArray pins = doc["pins"].as<JsonArray>();
     uint8_t newCount = pins.size();
+    if (newCount == 0) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Pins array cannot be empty\"}");
+        return;
+    }
     if (newCount > MAX_RELAYS) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Too many pins\"}");
         return;
@@ -3824,13 +5300,32 @@ void handleSaveGPIOConfig() {
     gpioConfig.count = newCount;
     int idx = 0;
     for (JsonVariant pin : pins) {
-        gpioConfig.pins[idx] = pin.as<uint8_t>();
+        uint8_t newPinVal = pin.as<uint8_t>();
+        gpioConfig.pins[idx] = newPinVal;
         if (idx < MAX_RELAYS) {
-            relayConfigs[idx].manualOverride = oldManualOverride[idx];
-            relayConfigs[idx].manualState = oldManualState[idx];
-            strcpy(relayConfigs[idx].name, oldNames[idx]);
-            relayConfigs[idx].schedule = oldSchedules[idx];
-            gpioConfig.activeLow[idx] = oldActiveLow[idx];
+            int matchIdx = -1;
+            for (uint8_t k = 0; k < oldCount; k++) {
+                if (oldPins[k] == newPinVal) { matchIdx = k; break; }
+            }
+            if (matchIdx >= 0) {
+                relayConfigs[idx].manualOverride = oldManualOverride[matchIdx];
+                relayConfigs[idx].manualState    = oldManualState[matchIdx];
+                strncpy(relayConfigs[idx].name, oldNames[matchIdx], 15);
+                relayConfigs[idx].name[15] = '\0';
+                relayConfigs[idx].schedule       = oldSchedules[matchIdx];
+                gpioConfig.activeLow[idx]        = oldActiveLow[matchIdx];
+            } else {
+                relayConfigs[idx].manualOverride = false;
+                relayConfigs[idx].manualState    = false;
+                snprintf(relayConfigs[idx].name, 16, "Relay %d", idx + 1);
+                memset(&relayConfigs[idx].schedule, 0, sizeof(TimerSchedule));
+                for (int s = 0; s < 8; s++) {
+                    relayConfigs[idx].schedule.days[s]      = DAY_ALL;
+                    relayConfigs[idx].schedule.monthDays[s] = 0x7FFFFFFFUL;
+                    relayConfigs[idx].schedule.monthMask[s] = MONTH_ALL;
+                }
+                gpioConfig.activeLow[idx] = true;
+            }
             relayConfigs[idx].magic = RELAY_CONFIG_MAGIC;
         }
         idx++;
@@ -3839,10 +5334,26 @@ void handleSaveGPIOConfig() {
         initScheduleDefaults(i);
         gpioConfig.activeLow[i] = true;
     }
+    for (uint8_t i = 0; i < oldCount; i++) {
+        bool stillUsed = false;
+        for (uint8_t j = 0; j < newCount; j++) {
+            if (oldPins[i] == parsed[j]) { stillUsed = true; break; }
+        }
+        if (!stillUsed && oldPins[i] != 0xFF) {
+            bool wasActiveLow = oldActiveLow[i];
+            if (extConfig.global_active_mode == 1) wasActiveLow = true;
+            else if (extConfig.global_active_mode == 2) wasActiveLow = false;
+            digitalWrite(oldPins[i], wasActiveLow ? HIGH : LOW);
+            pinMode(oldPins[i], INPUT);
+        }
+    }
     for (uint8_t i = 0; i < gpioConfig.count; i++) {
         pinMode(gpioConfig.pins[i], OUTPUT);
-        bool preserve = (i < oldCount) && (oldPins[i] == gpioConfig.pins[i]);
-        bool state = preserve ? oldRelayOutputs[i] : false;
+        int matchIdx = -1;
+        for (uint8_t k = 0; k < oldCount; k++) {
+            if (oldPins[k] == gpioConfig.pins[i]) { matchIdx = k; break; }
+        }
+        bool state = (matchIdx >= 0) ? oldRelayOutputs[matchIdx] : false;
         setRelayOutput(i, state);
         lastRelayOutputs[i] = state;
         lastDebouncedStateGlobal[i] = state;
@@ -3855,7 +5366,6 @@ void handleSaveGPIOConfig() {
 }
 
 void handleAddGPIO() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3864,6 +5374,11 @@ void handleAddGPIO() {
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("pin") || !doc["pin"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid pin field\"}");
         return;
     }
     int rawPin = doc["pin"] | -1;
@@ -3910,7 +5425,6 @@ void handleAddGPIO() {
 }
 
 void handleDeleteGPIO() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3921,12 +5435,23 @@ void handleDeleteGPIO() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
+    if (!doc.containsKey("index") || !doc["index"].is<uint8_t>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid index field\"}");
+        return;
+    }
     uint8_t index = doc["index"];
     if (index >= gpioConfig.count) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid index\"}");
         return;
     }
+    uint8_t removedPin = gpioConfig.pins[index];
+    bool removedActiveLow = gpioConfig.activeLow[index];
+    if (extConfig.global_active_mode == 1) removedActiveLow = true;
+    else if (extConfig.global_active_mode == 2) removedActiveLow = false;
     setRelayOutput(index, false);
+    delay(1);
+    digitalWrite(removedPin, removedActiveLow ? HIGH : LOW);
+    pinMode(removedPin, INPUT);
     for (uint8_t i = index; i < gpioConfig.count - 1; i++) {
         gpioConfig.pins[i] = gpioConfig.pins[i + 1];
         gpioConfig.activeLow[i] = gpioConfig.activeLow[i + 1];
@@ -3950,7 +5475,6 @@ void handleDeleteGPIO() {
 }
 
 void handleToggleActiveLow() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3959,6 +5483,10 @@ void handleToggleActiveLow() {
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("index") || !doc["index"].is<uint8_t>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid index field\"}");
         return;
     }
     uint8_t index = doc["index"];
@@ -3980,7 +5508,6 @@ void handleToggleActiveLow() {
 //  GLOBAL ACTIVE MODE HANDLER
 // =============================================================================
 void handleGlobalActiveMode() {
-    lastConnectionActivity = millis();
     if (!server.hasArg("plain")) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
         return;
@@ -3989,6 +5516,10 @@ void handleGlobalActiveMode() {
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("mode") || !doc["mode"].is<uint8_t>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid mode field\"}");
         return;
     }
     uint8_t mode = doc["mode"];
