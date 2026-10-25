@@ -16,7 +16,7 @@
 #include <ArduinoJson.h>
 #include <esp_timer.h>
 #include <esp_system.h>
-#include <heap_caps.h>
+#include <esp_heap_caps.h>
 #include <sys/time.h>
 
 #if !defined(ARDUINOJSON_VERSION_MAJOR) || ARDUINOJSON_VERSION_MAJOR < 7
