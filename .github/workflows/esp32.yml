@@ -34,7 +34,7 @@ jobs:
         
         # Compile firmware
         mv *.ino arduino.ino
-        arduino-cli compile --fqbn esp32:esp32:esp32:FlashSize=4M,PartitionScheme=no_ota --output-dir firmware .
+        arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=noota_ffat --output-dir firmware .
         
         # Rename
         mv firmware/*.ino.bootloader.bin  firmware/bootloader-0x1000.bin
