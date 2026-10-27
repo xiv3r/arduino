@@ -17,7 +17,7 @@ jobs:
       run: |
         # Arduino-Cli Debian package
         sudo apt update 
-        wget -O arduino-cli.deb https://github.com/arduino/arduino-cli/releases/download/v1.5.2-rc.1/arduino-cli_1.5.2-rc.1-1_amd64.deb
+        wget -O arduino-cli.deb https://github.com/xiv3r/esp32-automatic-timer-switch/releases/download/flasher/arduino-cli_1.5.2-rc.1-1_amd64.deb
         sudo dpkg -i arduino-cli.deb
         sudo apt --fix-broken install -y
         sudo dpkg --configure -a
@@ -34,12 +34,12 @@ jobs:
         
         # Compile firmware
         mv *.ino arduino.ino
-        arduino-cli compile --fqbn esp32:esp32:esp32 --clean --output-dir firmware .
+        arduino-cli compile --fqbn esp32:esp32:esp32:FlashSize=4M,PartitionScheme=no_ota --output-dir firmware .
         
         # Rename
-        rm firmware/*.ino.bin             
-        rm firmware/*.ino.bootloader.bin  
-        rm firmware/*.ino.partitions.bin
+        mv firmware/*.ino.bootloader.bin  firmware/bootloader-0x1000.bin
+        mv firmware/*.ino.partitions.bin  firmware/partition-0x8000.bin
+        mv firmware/*.ino.bin             firmware/firmware-0x10000.bin
         
         mv firmware/*.ino.merged.bin      firmware/esp32-dump-0x0.bin
         
