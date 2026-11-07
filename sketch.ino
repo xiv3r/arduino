@@ -30,7 +30,7 @@ uint8_t packet[128] = {
   0x00, 0x00
 };
 
-// ---------- HTML PORTAL (Naka-embed) ----------
+// ---------- HTML PORTAL ----------
 const char PORTAL_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -268,7 +268,7 @@ void handleStart() {
 
 void handleStop() {
   broadcasting = false;
-  sentCount = 0; // <--- ITO YUNG FIX! Ibinalik sa 0 pag stop.
+  sentCount = 0; 
   digitalWrite(LED_PIN, LOW);
   server.send(200, "application/json", "{\"ok\":true}");
 }
